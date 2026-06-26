@@ -1,35 +1,33 @@
-import os
 import time
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
-from groq import Groq
+from typing import Dict, Any, Optional
 import groq
 from langdetect import detect, DetectorFactory
-from api_manager import SupabaseKeyManager  # Import your cloud rotation manager
+# 5. Clean Architectural Import: Relies on api_key_manager for client state
+from app.services.api_key_manager import _get_groq_client
 
 # Set seed for reproducible local language detection results
 DetectorFactory.seed = 0
 
-# Configure production logging format
+# 8. Production Logging Configuration (Tracks metadata without bleeding sensitive text context)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [Req: %(pathname)s] - %(message)s")
 
 # =====================================================================
-# 3. MODEL CONFIGURATION CONSTANTS
+# MODEL CONFIGURATION & CONTEXT CONSTANTS
 # =====================================================================
 MODEL_NAME = "qwen/qwen3-32b"
 TEMPERATURE = 0.3
 MAX_TOKENS = 1000
 TOP_P = 0.9
-STREAM_MODE = False  # 11. Readily toggled for future streaming pipelines
+STREAM_MODE = False
 
-# 2. CONTEXT LIMITS
 MAX_CONTEXT_CHUNKS = 5
 MAX_CONTEXT_CHAR_LIMIT = 8000 
 
 # =====================================================================
-# 4. EXPANDED LANGUAGE MAPPING
+# 2. SUPPORTED MULTILINGUAL LOCAL MATRIX
 # =====================================================================
 LANGUAGE_MAP = {
     "en": "English",
@@ -45,25 +43,11 @@ LANGUAGE_MAP = {
     "ur": "Urdu"
 }
 
-# =====================================================================
-# 1 & 10. DYNAMIC KEY MANAGER INITIALIZATION
-# =====================================================================
-# Initialize your Supabase database key manager instance
-key_manager = SupabaseKeyManager()
-
-def _get_groq_client() -> Optional[Groq]:
-    """Dynamically fetches a Groq client mapped to the active working key from Supabase."""
-    active_key = key_manager.get_active_key()
-    if not active_key:
-        logging.critical("No active Groq API Key could be pulled from the cloud database.")
-        return None
-    return Groq(api_key=active_key)
-
 
 def _detect_language_locally(text: str) -> str:
-    """Detects the ISO 639-1 language code locally.
+    """2. Analyzes user strings locally on CPU using ISO maps to save API costs.
     
-    Falls back to 'English' if the language is unknown or detection fails.
+    Defaults cleanly to English if detection bounds fail.
     """
     try:
         lang_code = detect(text)
@@ -73,44 +57,44 @@ def _detect_language_locally(text: str) -> str:
 
 
 def _process_context(raw_context: Any) -> str:
-    """2. Validates, limits, and truncates retrieved context chunks to preserve 
-    token bandwidth and improve RAG performance accuracy.
+    """3. Validates incoming chunks, protects token bounds, and handles truncations 
+    to insulate Groq against token inflation.
     """
     if not raw_context:
         return ""
         
-    # If context arrives as a list of chunks, combine up to the specified maximum
     if isinstance(raw_context, list):
-        target_chunks = raw_context[:MAX_CONTEXT_CHUNKS]
-        combined = "\n\n".join([str(chunk).strip() for chunk in target_chunks])
+        # Filter empty lines or falsy values from structural payloads
+        valid_chunks = [str(chunk).strip() for chunk in raw_context if chunk and str(chunk).strip()]
+        target_slices = valid_chunks[:MAX_CONTEXT_CHUNKS]
+        combined = "\n\n".join(target_slices)
     else:
         combined = str(raw_context).strip()
         
-    # Apply global hard character truncation threshold
+    # Apply hard maximum character limits safely
     return combined[:MAX_CONTEXT_CHAR_LIMIT]
 
 
 # =====================================================================
-# CORE LLM SERVICE INTERFACE
+# 1. CORE LLM GENERATION WORKSPACE (SINGLE RESPONSIBILITY ENGINE)
 # =====================================================================
 def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]:
-    """Processes an incoming user financial query via RAG using the Groq API.
-
-    14. Future Ready Design: Dedicated strictly to Language Routing, Prompt Building, 
-    API execution, and response structural formatting. Includes automatic database-driven 
-    quota failover.
+    """6. Formulates system-instructions and routes operational prompts over Groq client bindings.
+    
+    Strict Design Boundary: Has no exposure to core DB queries, Whisper audio strings, 
+    Redis, or client credentials. Expects clean runtime strings.
     """
     start_time = time.time()
     
-    # 7. Generate a unique tracking UUID for traceability mapping across services
+    # 9. Traceability tracking properties instantiation
     request_id = str(uuid.uuid4())
     timestamp_str = datetime.now(timezone.utc).isoformat()
     
-    # 2 & 4. Run performance extraction layers locally
+    # Executing operational preparation sub-layers
     detected_language = _detect_language_locally(user_query)
     clean_context = _process_context(retrieved_context)
     
-    # 13. Context Validation Boundary
+    # Context Validation Fallback Configuration Block
     if not clean_context:
         context_instruction = (
             "CRITICAL: No reliable information or localized database matches were found for this query.\n"
@@ -126,7 +110,7 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         )
         knowledge_block = clean_context
 
-    # 5. Formulate strict, non-duplicate production-hardened instructions
+    # 4. Prompt Engineering System Instruction Blueprint
     system_instruction = (
         "You are 'Appna Bank AI', a warm financial companion for farmers, students, and rural communities.\n\n"
         "RESPONSE RULES:\n"
@@ -141,7 +125,6 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         "- Absolute restriction: Never dispense risky stock updates or speculative advice to seniors or low-income households."
     )
 
-    # 6. Streamlined clear block structure (No redundant language rules inside user block)
     full_prompt = f"""
 ========== KNOWLEDGE BASE ==========
 {knowledge_block}
@@ -154,22 +137,22 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
     error_type = None
     answer = ""
 
-    # Fetch active client using database credentials
+    # 5. Delegate Client Construction Lifecycle to separate service
     groq_client = _get_groq_client()
     if not groq_client:
         return {
             "request_id": request_id,
             "timestamp": timestamp_str,
             "detected_language": detected_language,
-            "answer": "System configuration error: No active keys found in the backend database.",
+            "answer": "System configuration error: No active keys found in the backend database mapping clusters.",
             "model": MODEL_NAME,
             "success": False,
-            "source": "Groq Error Manager",
+            "source": "Groq Key Error Routing Service Node",
             "response_time": round(time.time() - start_time, 3)
         }
 
     try:
-        # ATTEMPT 1: Try executing request with current active key
+        # 6. Execute core operational transaction payload over Groq client wrapper
         response = groq_client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -183,45 +166,16 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         )
         answer = response.choices[0].message.content
 
-    except groq.RateLimitError:
-        # QUOTA FINISHED FALLBACK: Automatically rotate state in database and fetch next key
-        logging.warning(f"[Req: {request_id}] Active API key quota finished! Marking exhausted in database...")
-        next_key = key_manager.handle_quota_exhausted()
-        
-        if next_key:
-            try:
-                logging.info(f"[Req: {request_id}] Executing immediate fallback retry with backup key pipeline slot...")
-                fallback_client = Groq(api_key=next_key)
-                
-                # ATTEMPT 2: Retry calculation instantly with backup credentials
-                response = fallback_client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": full_prompt}
-                    ],
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS,
-                    top_p=TOP_P,
-                    stream=STREAM_MODE
-                )
-                answer = response.choices[0].message.content
-                success = True
-                error_type = None
-            except Exception as e:
-                success = False
-                error_type = f"FallbackRetryError: {type(e).__name__}"
-                answer = "Our servers are experiencing high utilization. Please try again in a few moments."
-        else:
-            success = False
-            error_type = "AllKeysDepleted"
-            answer = "All system processing pathways are currently undergoing maintenance. Please try again shortly."
-
-    # 6. Comprehensive API Error Routing Boundaries
+    # 7. Comprehensive Error Routing Context Mapping (Returns user-friendly alerts)
     except groq.AuthenticationError:
         success = False
         error_type = "AuthenticationError"
         answer = "I am currently facing authentication issues logging into my backend network. Please check back soon."
+        
+    except groq.RateLimitError:
+        success = False
+        error_type = "RateLimitError"
+        answer = "Our servers are experiencing heavy traffic. Please wait a minute and try asking again."
         
     except groq.APIStatusError as e:
         success = False
@@ -240,13 +194,13 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
 
     elapsed_time = round(time.time() - start_time, 3)
 
-    # 9. Clean audit logging (Excludes internal queries, system prompts, or confidential customer parameters)
+    # 8. Clean Audit Metric Tracking Log Call (Excludes prompts and customer queries)
     logging.info(
         f"Req ID: {request_id} | Model: {MODEL_NAME} | Lang: {detected_language} | "
         f"Latency: {elapsed_time}s | Success: {success} | Error Type: {error_type}"
     )
 
-    # 8. Complete analytic data payload
+    # 9. Standardized Structural Analytics Response Payload Object Frame Output
     return {
         "request_id": request_id,
         "timestamp": timestamp_str,
