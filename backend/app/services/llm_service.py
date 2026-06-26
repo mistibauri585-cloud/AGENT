@@ -3,10 +3,11 @@ import time
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from groq import Groq
 import groq
 from langdetect import detect, DetectorFactory
+from api_manager import SupabaseKeyManager  # Import your cloud rotation manager
 
 # Set seed for reproducible local language detection results
 DetectorFactory.seed = 0
@@ -45,21 +46,18 @@ LANGUAGE_MAP = {
 }
 
 # =====================================================================
-# 1 & 10. SINGLETON CLIENT INITIALIZATION (PREPARED FOR API MANAGER)
+# 1 & 10. DYNAMIC KEY MANAGER INITIALIZATION
 # =====================================================================
-def _initialize_groq_client() -> Groq:
-    """Initializes the Groq client once at application startup.
-    
-    Can be seamlessly redirected to pull keys dynamically from an API Key Manager
-    without disrupting downstream business logic.
-    """
-    api_key = os.getenv("GROQ_API_KEY", "")
-    if not api_key:
-        logging.warning("GROQ_API_KEY environment variable is missing at lifecycle initiation.")
-    return Groq(api_key=api_key)
+# Initialize your Supabase database key manager instance
+key_manager = SupabaseKeyManager()
 
-# Instantiated once on initialization module-level load
-groq_client = _initialize_groq_client()
+def _get_groq_client() -> Optional[Groq]:
+    """Dynamically fetches a Groq client mapped to the active working key from Supabase."""
+    active_key = key_manager.get_active_key()
+    if not active_key:
+        logging.critical("No active Groq API Key could be pulled from the cloud database.")
+        return None
+    return Groq(api_key=active_key)
 
 
 def _detect_language_locally(text: str) -> str:
@@ -99,16 +97,8 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
     """Processes an incoming user financial query via RAG using the Groq API.
 
     14. Future Ready Design: Dedicated strictly to Language Routing, Prompt Building, 
-    API execution, and response structural formatting.
-
-    Args:
-        user_query (str): The raw text message input provided by the end user.
-        retrieved_context (Any): Raw context string or list of text chunks fetched 
-                                 from the vector knowledge base.
-
-    Returns:
-        Dict[str, Any]: Structured operational payload containing the generated response, 
-                        execution diagnostics, and pipeline tracking metadata metrics.
+    API execution, and response structural formatting. Includes automatic database-driven 
+    quota failover.
     """
     start_time = time.time()
     
@@ -160,8 +150,26 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
 {user_query}
 """
 
+    success = True
+    error_type = None
+    answer = ""
+
+    # Fetch active client using database credentials
+    groq_client = _get_groq_client()
+    if not groq_client:
+        return {
+            "request_id": request_id,
+            "timestamp": timestamp_str,
+            "detected_language": detected_language,
+            "answer": "System configuration error: No active keys found in the backend database.",
+            "model": MODEL_NAME,
+            "success": False,
+            "source": "Groq Error Manager",
+            "response_time": round(time.time() - start_time, 3)
+        }
+
     try:
-        # 1. Reuses the application startup client directly
+        # ATTEMPT 1: Try executing request with current active key
         response = groq_client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -173,21 +181,47 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
             top_p=TOP_P,
             stream=STREAM_MODE
         )
-        
         answer = response.choices[0].message.content
-        success = True
-        error_type = None
+
+    except groq.RateLimitError:
+        # QUOTA FINISHED FALLBACK: Automatically rotate state in database and fetch next key
+        logging.warning(f"[Req: {request_id}] Active API key quota finished! Marking exhausted in database...")
+        next_key = key_manager.handle_quota_exhausted()
+        
+        if next_key:
+            try:
+                logging.info(f"[Req: {request_id}] Executing immediate fallback retry with backup key pipeline slot...")
+                fallback_client = Groq(api_key=next_key)
+                
+                # ATTEMPT 2: Retry calculation instantly with backup credentials
+                response = fallback_client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": full_prompt}
+                    ],
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                    top_p=TOP_P,
+                    stream=STREAM_MODE
+                )
+                answer = response.choices[0].message.content
+                success = True
+                error_type = None
+            except Exception as e:
+                success = False
+                error_type = f"FallbackRetryError: {type(e).__name__}"
+                answer = "Our servers are experiencing high utilization. Please try again in a few moments."
+        else:
+            success = False
+            error_type = "AllKeysDepleted"
+            answer = "All system processing pathways are currently undergoing maintenance. Please try again shortly."
 
     # 6. Comprehensive API Error Routing Boundaries
     except groq.AuthenticationError:
         success = False
         error_type = "AuthenticationError"
         answer = "I am currently facing authentication issues logging into my backend network. Please check back soon."
-        
-    except groq.RateLimitError:
-        success = False
-        error_type = "RateLimitError"
-        answer = "Our servers are experiencing heavy traffic. Please wait a minute and try asking again."
         
     except groq.APIStatusError as e:
         success = False
