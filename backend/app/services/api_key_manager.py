@@ -1,19 +1,18 @@
 import os
 import logging
 from typing import Optional
+from datetime import datetime, timezone
 from supabase import create_client, Client
 
 # Configure production logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [Key Manager] - %(message)s")
 
 class SupabaseKeyManager:
     def __init__(self):
         """
-        Manages rotating API keys directly from a Supabase database.
-        Allows the developer to manually replace or add keys via the Supabase dashboard
-        with instant, zero-downtime updates on Railway.
+        Manages an infinite, cyclic rotating pool of API keys from Supabase.
+        Keys are continuously balanced by usage recency (oldest used key picked first).
         """
-        # Fetch Supabase credentials securely from Railway Environment Variables
         supabase_url = os.getenv("SUPABASE_URL", "")
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
         
@@ -24,70 +23,96 @@ class SupabaseKeyManager:
             self.supabase = create_client(supabase_url, supabase_key)
             
         self._active_key: Optional[str] = None
-        self._active_key_id: Optional[int] = None
+        self._active_key_id: Optional[str] = None
 
     def refresh_keys_from_db(self) -> Optional[str]:
         """
-        Queries Supabase for the oldest key marked as 'active'.
-        Runs on initial startup and whenever a key rotation is triggered.
+        Pulls the oldest 'active' key from Supabase based on 'last_used_at'.
+        This creates an infinite cyclic queue when exhausted keys are reset to active.
         """
         if not self.supabase:
             logging.error("Supabase client is not initialized.")
             return None
 
         try:
-            response = self.supabase.table("api_keys") \
-                .select("id, key_value") \
+            # CRITICAL: Sorting by last_used_at ASC means the key that hasn't been used 
+            # for the longest time rotates to the front of the line.
+            response = self.supabase.table("groq_api_keys") \
+                .select("id, api_key") \
                 .eq("status", "active") \
-                .order("id") \
+                .order("last_used_at", ascending=True) \
                 .limit(1) \
                 .execute()
 
             data = response.data
             if data and len(data) > 0:
                 self._active_key_id = data[0]["id"]
-                self._active_key = data[0]["key_value"].strip()
-                logging.info(f"Loaded working API Key from Supabase slot ID: {self._active_key_id}")
+                self._active_key = data[0]["api_key"].strip()
+                logging.info(f"Cyclic Loop -> Loaded oldest active key ID: {self._active_key_id}")
+                
+                # Instantly stamp the current time. This pushes this key to the back of the line 
+                # for the next transaction, ensuring all 5 keys share the traffic equally.
+                try:
+                    self.supabase.table("groq_api_keys").update(
+                        {
+                            "last_used_at": datetime.now(timezone.utc).isoformat()
+                        }
+                    ).eq(
+                        "id",
+                        self._active_key_id
+                    ).execute()
+                except Exception as update_err:
+                    logging.error(f"Non-fatal error pushing key to back of usage queue: {str(update_err)}")
+                
                 return self._active_key
             else:
-                logging.critical("!!! ALL API KEYS IN SUPABASE ARE EXHAUSTED !!!")
+                logging.critical("!!! ALL REGISTERED API KEYS ARE EXHAUSTED !!! Waiting for manual dashboard reset.")
                 self._active_key = None
                 self._active_key_id = None
                 return None
                 
         except Exception as e:
-            logging.error(f"Error reading keys from Supabase: {str(e)}")
+            logging.error(f"Error executing dynamic key query rotation loop: {str(e)}")
             return None
 
     def get_active_key(self) -> Optional[str]:
-        """Returns the current cached key. If empty, pulls freshest from DB."""
+        """Returns the currently loaded key. If empty or cleared, refreshes from DB queue."""
         if not self._active_key:
             return self.refresh_keys_from_db()
         return self._active_key
 
     def handle_quota_exhausted(self) -> Optional[str]:
         """
-        Marks the active key as 'exhausted' in Supabase when a quota/rate error is hit,
-        then instantly retrieves the next available active key.
+        Flags the broken key as 'exhausted' with a timestamp, clears local cache,
+        and instantly pops the next waiting active key from the queue.
         """
         if not self.supabase or not self._active_key_id:
-            logging.error("Cannot rotate key: Database offline or no active key loaded.")
+            logging.error("Cannot rotate key: Database offline or no tracking state loaded.")
             return None
 
         try:
             bad_id = self._active_key_id
-            logging.warning(f"Quota finished for Key ID [{bad_id}]. Updating Supabase status to 'exhausted'...")
+            logging.warning(f"Quota Exhausted for Key ID [{bad_id}]. Drop-flagging in Supabase...")
 
-            # Update the status field on Supabase
-            self.supabase.table("api_keys") \
-                .update({"status": "exhausted"}) \
-                .eq("id", bad_id) \
-                .execute()
+            # Take the key out of the active loop rotation instantly
+            self.supabase.table("groq_api_keys").update(
+                {
+                    "status": "exhausted",
+                    "exhausted_at": datetime.now(timezone.utc).isoformat()
+                }
+            ).eq(
+                "id",
+                bad_id
+            ).execute()
 
-            # Instantly pull the next available working key from the table
+            # Force clear local instance state so get_active_key() pulls a fresh row
+            self._active_key = None
+            self._active_key_id = None
+
+            # Instantly step to the next available account line item
             return self.refresh_keys_from_db()
 
         except Exception as e:
-            logging.error(f"Failed to update key status in Supabase: {str(e)}")
+            logging.error(f"Failed to isolate exhausted key status in Supabase: {str(e)}")
             self._active_key = None
             return None
