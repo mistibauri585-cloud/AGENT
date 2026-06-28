@@ -5,7 +5,7 @@ import threading
 from typing import Dict, Any, Optional
 import chromadb
 from chromadb.api import ClientAPI
-from chromadb.api.models.CollectionAPI import CollectionAPI
+from chromadb.api.models.Collection import Collection  # FIXED: Modernized import path
 from chromadb.utils import embedding_functions
 
 # =====================================================================
@@ -36,7 +36,7 @@ _chroma_client: Optional[ClientAPI] = None
 _embedding_function: Optional[embedding_functions.SentenceTransformerEmbeddingFunction] = None
 
 # 5. Memory Cache map to eliminate repetitive lookup overhead
-_collection_cache: Dict[str, CollectionAPI] = {}
+_collection_cache: Dict[str, Collection] = {}  # FIXED: Updated type hint to Collection
 
 
 def initialize_database() -> None:
@@ -79,7 +79,7 @@ def initialize_database() -> None:
             raise RuntimeError(f"Database Core Matrix Initialization Failure: {str(e)}")
 
 
-def get_collection(name: str) -> CollectionAPI:
+def get_collection(name: str) -> Collection:  # FIXED: Return type hint to Collection
     """Creates or fetches a cached collection instance partition.
 
     10. Separation of Concerns: Completely independent from downstream prompting architectures,
@@ -89,7 +89,7 @@ def get_collection(name: str) -> CollectionAPI:
         name (str): Unique target structural partition lookup index handle.
 
     Returns:
-        CollectionAPI: Cached reusable instance mapping query transactional utilities.
+        Collection: Cached reusable instance mapping query transactional utilities.
     """
     if not _initialized:
         initialize_database()
