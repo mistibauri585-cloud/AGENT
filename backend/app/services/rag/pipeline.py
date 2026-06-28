@@ -12,11 +12,11 @@ from pypdf import PdfReader
 # Configuration and retrieval initialization client wrapper from your database module
 from app.database.chromadb_client import get_collection
 
-# Configure Production Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configure Production Module-Scoped Logging (No basicConfig overrides inside this file)
+logger = logging.getLogger(__name__)
 
 # =====================================================================
-# 9. TUNED CONFIGURATION & CONSTANTS
+# TUNED CONFIGURATION & CONSTANTS
 # =====================================================================
 COLLECTION_ROUTING = {
     "default": "banking_knowledge",
@@ -35,7 +35,7 @@ MAX_CONTEXT_CHUNKS = 4
 MAX_CONTEXT_CHAR_LIMIT = 8000
 
 # =====================================================================
-# 4. INTENT ROUTING DICTIONARY MAP
+# INTENT ROUTING DICTIONARY MAP
 # =====================================================================
 INTENT_KEYWORDS = {
     "loans": ["loan", "emi", "interest", "borrow", "mortgage", "kcc", "rin", "byaj"],
@@ -44,7 +44,7 @@ INTENT_KEYWORDS = {
 
 
 # =====================================================================
-# INTERNALS: CHUNKING, TEXT PROCESSING & RICH METADATA INGESTION
+# CHUNKING, TEXT PROCESSING & RICH METADATA INGESTION
 # =====================================================================
 def split_text_into_chunks(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_CHUNK_OVERLAP) -> List[str]:
     """Splits text content into granular overlapping chunk windows while normalizing spaces."""
@@ -87,14 +87,18 @@ def extract_pdf_pages(pdf_path: str) -> List[Dict[str, Any]]:
                         "text": text
                     })
             except Exception as page_err:
-                logging.error(f"Error parsing page {idx + 1} within file {pdf_path}: {str(page_err)}")
+                logger.error(f"Error parsing page {idx + 1} within file {pdf_path}: {str(page_err)}", exc_info=True)
     except Exception as e:
-        logging.error(f"Failed handling parsing pipeline sequence on file {pdf_path}: {str(e)}")
+        logger.error(f"Failed handling parsing pipeline sequence on file {pdf_path}: {str(e)}", exc_info=True)
     return pages_data
 
 
 def ingest_all_pdfs_from_folder(folder_path: str = "pdfs", language: str = "English", category: str = "banking", topic: str = "general", version: str = "1.0.0") -> str:
-    """Ingests filesystem PDF binaries directly inside configured target partitions with rich metadata."""
+    """Ingests filesystem PDF binaries directly inside configured target partitions with rich metadata.
+    
+    CRITICAL: Runs completely in a non-blocking configuration. If one PDF crashes or fails 
+    during processing, the error is logged, and the loop advances to index remaining documents.
+    """
     folder = Path(folder_path)
     if not folder.exists():
         folder.mkdir(parents=True, exist_ok=True)
@@ -111,11 +115,14 @@ def ingest_all_pdfs_from_folder(folder_path: str = "pdfs", language: str = "Engl
     total_files = 0
 
     for pdf_file in pdf_files:
+        # NON-BLOCKING IMPLEMENTATION: Every file gets its own execution box context
         try:
+            logger.info(f"Beginning indexing execution parameters for document file: {pdf_file.name}")
             file_size_kb = round(os.path.getsize(pdf_file) / 1024, 2)
             pages_extracted = extract_pdf_pages(str(pdf_file))
             
             if not pages_extracted:
+                logger.warning(f"File '{pdf_file.name}' returned empty payload strings. Skipping context ingestion.")
                 continue
                 
             for page_obj in pages_extracted:
@@ -133,7 +140,7 @@ def ingest_all_pdfs_from_folder(folder_path: str = "pdfs", language: str = "Engl
                     except Exception:
                         pass
                     
-                    # 5. Store Richer Production-Grade Metadata Schema Mapping
+                    # Store Richer Production-Grade Metadata Schema Mapping
                     collection.add(
                         ids=[chunk_id],
                         documents=[chunk],
@@ -152,19 +159,24 @@ def ingest_all_pdfs_from_folder(folder_path: str = "pdfs", language: str = "Engl
                         }]
                     )
                     total_chunks += 1
+            
             total_files += 1
-        except Exception as e:
-            logging.error(f"Error compiling ingestion parameters for document file data matrix {pdf_file.name}: {str(e)}")
+            logger.info(f"Successfully processed and indexed document file data matrix: {pdf_file.name}")
+
+        except Exception as file_error:
+            # Captures broken file signatures, preventing pipeline termination loops
+            logger.error(f"Incomplete document processing anomaly on file '{pdf_file.name}': {str(file_error)}", exc_info=True)
+            logger.warning(f"Isolating failure footprint for '{pdf_file.name}'. Safely proceeding to downstream folder array entries.")
+            continue
 
     return f"Ingested {total_files} files into {total_chunks} blocks inside target partition context [{collection_name}]."
 
 
 # =====================================================================
-# 4. ROUTING AND INTENT EXTRACTION LAYER
+# ROUTING AND INTENT EXTRACTION LAYER
 # =====================================================================
 def _determine_intent_collections(query: str, detected_language: str) -> List[str]:
-    """4. Evaluates incoming user intent parameters to route queries efficiently,
-
+    """Evaluates incoming user intent parameters to route queries efficiently,
     minimizing redundant cross-collection searching.
     """
     query_lower = query.lower()
@@ -189,7 +201,7 @@ def _determine_intent_collections(query: str, detected_language: str) -> List[st
 
 
 # =====================================================================
-# 3. METRIC METADATA EXTRACTION & ADJACENT CHUNK MERGING
+# METRIC METADATA EXTRACTION & ADJACENT CHUNK MERGING
 # =====================================================================
 def _query_single_collection(collection_name: str, query: str, n_results: int) -> List[Dict[str, Any]]:
     """Fetches high-precision matches out of a targeted partition segment folder layer."""
@@ -202,12 +214,12 @@ def _query_single_collection(collection_name: str, query: str, n_results: int) -
             return []
             
         docs = results.get("documents", [[]])[0]
-        # 1. FIXED: Correctly reference ChromaDB metadata key response payload parameter
+        # Correctly reference ChromaDB metadata key response payload parameter
         metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else [{} for _ in docs]
         distances = results.get("distances", [[]])[0] if results.get("distances") else [0.0 for _ in docs]
         
         for i in range(len(docs)):
-            # 3. Handle configured cosine metrics directly where smaller distances mean high semantic links
+            # Handle configured cosine metrics directly where smaller distances mean high semantic links
             raw_distance = distances[i]
             similarity_score = round(float(1.0 - raw_distance), 3)
             
@@ -218,13 +230,13 @@ def _query_single_collection(collection_name: str, query: str, n_results: int) -
                 "collection": collection_name
             })
         return extracted_chunks
-    except Exception:
+    except Exception as e:
+        logger.error(f"Partition query exception trace on context node '{collection_name}': {str(e)}")
         return []
 
 
 def _preserve_neighboring_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """6. Checks matching criteria signatures page and sequence identifiers
-
+    """Checks matching criteria signatures page and sequence identifiers
     to combine contiguous content nodes before LLM passing pipelines.
     """
     if len(chunks) <= 1:
@@ -235,7 +247,7 @@ def _preserve_neighboring_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str,
     
     for i in range(len(chunks)):
         if i in skip_indices:
-            continue
+            return chunks
             
         current_chunk = chunks[i]
         curr_meta = current_chunk.get("metadata", {})
@@ -282,7 +294,8 @@ def _execute_tavily_web_search(query: str) -> str:
         for result in response.get("results", []):
             web_context_blocks.append(f"[Web Source: {result.get('url')}] {result.get('content')}")
         return "\n\n".join(web_context_blocks)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Fallback internet search loop routing encountered an exception: {str(e)}")
         return ""
 
 
@@ -290,8 +303,8 @@ def _execute_tavily_web_search(query: str) -> str:
 # RAG PIPELINE EXPORT INTERFACE ENTRY POINT
 # =====================================================================
 def search_bookshelf(query: str, detected_language: str = "English", n_results: int = MAX_CONTEXT_CHUNKS) -> Dict[str, Any]:
-    """10. Independent RAG Processing Pipeline Segment Interface Node Entry.
-
+    """Independent RAG Processing Pipeline Segment Interface Node Entry.
+    
     Strict Separation of Concerns: Explicitly clean of LLM dependencies, prompt building structures, 
     or response compilation calls. Always processes text operations exclusively.
     """
@@ -300,7 +313,7 @@ def search_bookshelf(query: str, detected_language: str = "English", n_results: 
     if not query or not query.strip():
         return {"found": False, "context": "", "source": "No Query Provided Target Parameters", "similarity_score": 0.0}
 
-    # 4. Intent Routing Matrix Processing Layer 
+    # Intent Routing Matrix Processing Layer 
     target_collections = _determine_intent_collections(query, detected_language)
     all_retrieved_chunks: List[Dict[str, Any]] = []
     
@@ -325,7 +338,7 @@ def search_bookshelf(query: str, detected_language: str = "English", n_results: 
     # Filter items directly inside configured Threshold verification parameters
     filtered_chunks = [c for c in unique_chunks if c["score"] >= SIMILARITY_THRESHOLD]
     
-    # 6. Apply Neighboring Chunk Context Aggregations
+    # Apply Neighboring Chunk Context Aggregations
     processed_local_chunks = _preserve_neighboring_chunks(filtered_chunks)
     
     top_score = unique_chunks[0]["score"] if unique_chunks else 0.0
@@ -334,9 +347,9 @@ def search_bookshelf(query: str, detected_language: str = "English", n_results: 
     local_context_str = "\n\n".join([c["text"].strip() for c in processed_local_chunks[:MAX_CONTEXT_CHUNKS]])
     local_context_str = local_context_str[:MAX_CONTEXT_CHAR_LIMIT]
 
-    # 7. Merge Tavily and Local Knowledge Context Layers dynamically based on confidence scores
+    # Merge Tavily and Local Knowledge Context Layers dynamically based on confidence scores
     if not filtered_chunks or top_score < SIMILARITY_THRESHOLD:
-        logging.info(f"RAG confidence ({top_score}) below threshold ({SIMILARITY_THRESHOLD}). Activating Tavily fallback mapping loops.")
+        logger.info(f"RAG confidence ({top_score}) below threshold ({SIMILARITY_THRESHOLD}). Activating Tavily fallback mapping loops.")
         web_context = _execute_tavily_web_search(query)
         
         if web_context:
@@ -357,12 +370,12 @@ def search_bookshelf(query: str, detected_language: str = "English", n_results: 
 
     elapsed_time = round(time.time() - start_time, 3)
     
-    logging.info(
+    logger.info(
         f"RAG Search Complete -> Routed Collections: {target_collections} | Selected Source Node: {final_source} | "
         f"Confidence Score: {top_score} | Processing Latency Delay: {elapsed_time}s"
     )
 
-    # 4 & 8. Return Comprehensive Structured Analytics Interface Payload
+    # Return Comprehensive Structured Analytics Interface Payload
     return {
         "found": len(context_string.strip()) > 0,
         "context": context_string[:MAX_CONTEXT_CHAR_LIMIT],
