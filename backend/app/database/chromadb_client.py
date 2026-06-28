@@ -1,5 +1,5 @@
 import os
-import time  # 1. FIXED: Added explicitly to support health check metrics
+import time
 import logging
 import threading
 import json
@@ -7,7 +7,7 @@ import urllib.request
 from typing import Dict, Any, Optional, List
 import chromadb
 from chromadb.api import ClientAPI
-from chromadb.api.models.Collection import Collection  # Modernized import path
+from chromadb.api.models.Collection import Collection
 from chromadb.api.types import Documents, Embeddings, EmbeddingFunction
 
 # =====================================================================
@@ -17,7 +17,7 @@ CHROMA_DB_PATH: str = os.getenv("CHROMA_DB_PATH", "chroma_db_storage")
 EMBEDDING_MODEL_NAME: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 COLLECTION_METADATA_BLUEPRINT: Dict[str, Any] = {
-    "hnsw:space": "cosine",  # Pinning standard distance metrics explicitly
+    "hnsw:space": "cosine",  # Enforcing strict cosine similarity
     "project": "Appna Bank AI",
     "system_version": "1.0.0",
     "description": "Multilingual financial knowledge base vector storage partitions."
@@ -27,38 +27,49 @@ COLLECTION_METADATA_BLUEPRINT: Dict[str, Any] = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # =====================================================================
-# Custom Zero-RAM Serverless Embedding Function (No Strict Env Check)
+# Custom Zero-RAM Serverless Embedding Function
 # =====================================================================
 class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
-    """Custom embedding function to offload computation via urllib.
-    Consumes 0MB of local server RAM and requires no external 'requests' package or forced env vars.
+    """Custom embedding function that routes text formatting tasks remotely
+
+    to the Hugging Face Inference API. Consumes 0MB local server memory.
     """
     def __init__(self, api_key: str, model_name: str):
+        if not api_key:
+            raise RuntimeError(
+                "Critical Configuration Error: 'HUGGINGFACE_API_KEY' environment variable is missing. "
+                "Remote embedding computations cannot proceed without a valid token."
+            )
         self.api_key = api_key
         self.api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_name}"
 
     def __call__(self, input: Documents) -> Embeddings:
+        # Normalize incoming inputs into standard list strings
         texts = [input] if isinstance(input, str) else list(input)
         
         payload = json.dumps({"inputs": texts, "options": {"wait_for_model": True}}).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
         }
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
 
+        logging.info(f"Dispatching remote embedding vector request to Hugging Face API for batch size: {len(texts)}")
         try:
             req = urllib.request.Request(self.api_url, data=payload, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=30) as response:
+            with urllib.request.urlopen(req, timeout=15) as response:
                 result = json.loads(response.read().decode("utf-8"))
                 
+                # Check for explicit API error response mapping structures
                 if isinstance(result, dict) and "error" in result:
-                    raise ValueError(f"Hugging Face API Error: {result['error']}")
+                    raise RuntimeError(f"Hugging Face Remote API Exception: {result['error']}")
+                
+                if not isinstance(result, list):
+                    raise ValueError("Received an invalid response structure payload from Hugging Face endpoint.")
+                    
                 return result
         except Exception as e:
-            logging.error(f"API Embedding Generation failed: {str(e)}")
-            # Fallback mock dimension matching model outputs to allow pipeline boots
-            return [[0.0] * 384 for _ in texts]
+            logging.error(f"Fail-Fast Triggered - API Embedding Generation Failure: {str(e)}")
+            raise RuntimeError(f"Failed to generate embeddings remotely: {str(e)}")
 
 # =====================================================================
 # System Lifecycle Singletons & Cache Matrices
@@ -72,8 +83,10 @@ _collection_cache: Dict[str, Collection] = {}
 
 
 def initialize_database() -> None:
-    """Thread-safe initialization routine using a double-check locking pattern.
-    Completely isolated from native embedding function constraint errors.
+    """Thread-safe instantiation sequence using a double-check locking layout.
+    
+    CRITICAL: Does not run automatically on import. Must be explicitly invoked
+    from within the FastAPI application lifespan workflow inside main.py.
     """
     global _chroma_client, _embedding_function, _initialized
     
@@ -85,32 +98,30 @@ def initialize_database() -> None:
             return
             
         try:
-            logging.info(f"Initializing Production ChromaDB engine at storage path: {CHROMA_DB_PATH}")
+            logging.info(f"Initializing Production ChromaDB Persistent Architecture at: {CHROMA_DB_PATH}")
             os.makedirs(CHROMA_DB_PATH, exist_ok=True)
             
             _chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
             
-            logging.info(f"Connecting to Custom Serverless Embedding Endpoint: {EMBEDDING_MODEL_NAME}")
-            # Uses fallback system logic—no mandatory environment variable required to initialize
-            huggingface_key = os.getenv("HUGGINGFACE_API_KEY", os.getenv("CHROMA_HUGGINGFACE_API_KEY", ""))
-            
-            _embedding_function = ZeroRamHuggingFaceEmbedding(
-                api_key=huggingface_key,
-                model_name=EMBEDDING_MODEL_NAME
-            )
+            # Fetch authorization token securely
+            hf_token = os.getenv("HUGGINGFACE_API_KEY", "")
+            _embedding_function = ZeroRamHuggingFaceEmbedding(api_key=hf_token, model_name=EMBEDDING_MODEL_NAME)
             
             _initialized = True
-            logging.info("ChromaDB Core Layer and Custom API Embedding Matrix handles established successfully.")
+            logging.info("ChromaDB singletons and remote embedding pipelines mounted successfully.")
             
         except Exception as e:
-            logging.critical(f"Fatal core error initializing database vector infrastructure: {str(e)}")
+            logging.critical(f"Fail-Fast Core Lockout: Database Vector Matrix failed initialization: {str(e)}")
             raise RuntimeError(f"Database Core Matrix Initialization Failure: {str(e)}")
 
 
 def get_collection(name: str) -> Collection:
-    """Creates or fetches a cached collection instance partition."""
+    """Creates or fetches a cached collection instance partition.
+
+    Enforces safe execution under concurrent threaded requests.
+    """
     if not _initialized:
-        initialize_database()
+        raise RuntimeError("Core Database is uninitialized. Ensure initialize_database() is fired on lifespan start.")
         
     if name in _collection_cache:
         return _collection_cache[name]
@@ -120,7 +131,7 @@ def get_collection(name: str) -> Collection:
             return _collection_cache[name]
             
         try:
-            logging.info(f"Cache miss on partition handle [{name}]. Accessing storage directory.")
+            logging.info(f"Cache lookup miss for collection partition [{name}]. Initializing structural sync.")
             
             custom_metadata = COLLECTION_METADATA_BLUEPRINT.copy()
             custom_metadata["collection_identifier_name"] = name
@@ -132,36 +143,37 @@ def get_collection(name: str) -> Collection:
             )
             
             _collection_cache[name] = collection_instance
-            logging.info(f"Collection partition instance context [{name}] successfully mounted inside memory cache.")
+            logging.info(f"Collection partition instance [{name}] successfully written back to memory cache.")
             
             return collection_instance
             
         except Exception as e:
-            logging.error(f"Failed loading or creating collection reference identifier [{name}]: {str(e)}")
+            logging.error(f"Failed mounting or creating collection reference identifier [{name}]: {str(e)}")
             raise ValueError(f"Collection initialization error exception failure on context name '{name}': {str(e)}")
 
 
 def check_database() -> Dict[str, Any]:
-    """Verifies the connectivity, availability, and telemetry status of database interfaces."""
+    """Verifies the health, network availability, and connection telemetry statistics of vector components."""
     start_time = time.time()
     is_healthy = False
-    diagnostic_message = "Database components operational."
+    diagnostic_message = "All database modules responding optimally."
     cached_partitions_count = 0
     
     try:
         if not _initialized:
-            initialize_database()
+            raise RuntimeError("Database component layer is currently uninitialized.")
             
         if _chroma_client is None or _embedding_function is None:
-            raise RuntimeError("Database singletons or model parameters are uninitialized.")
+            raise RuntimeError("Database configuration runtime matrices are broken or uninstantiated.")
             
+        # Execute diagnostic heartbeat pulse check
         _chroma_client.heartbeat()
         cached_partitions_count = len(_collection_cache)
         is_healthy = True
         
     except Exception as e:
-        diagnostic_message = f"Health check failed: {str(e)}"
-        logging.error(f"Health status check failure exception log trace mapping: {diagnostic_message}")
+        diagnostic_message = f"Health diagnostic check failed: {str(e)}"
+        logging.error(f"Health status assessment failure exception tracking log: {diagnostic_message}")
         
     elapsed_ms = round((time.time() - start_time) * 1000, 2)
     
@@ -174,7 +186,3 @@ def check_database() -> Dict[str, Any]:
         "latency_ms": elapsed_ms,
         "message": diagnostic_message
     }
-
-
-# Automatically execute core structural configurations on startup
-initialize_database()
