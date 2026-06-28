@@ -12,8 +12,8 @@ python-multipart>=0.0.18
 redis>=5.0.0
 supabase>=2.10.0
 
-# Vector Database Infrastructures (Lightweight HTTP Client Only)
-chromadb-client>=1.5.0
+# Vector Database Infrastructures (Full Storage Engine Driver)
+chromadb>=0.6.3
 
 # System Localization Matrices
 langdetect>=1.0.9
