@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional
 import groq
 from langdetect import detect, DetectorFactory
 
-# FIXED: Import the actual manager class instead of the missing function
+# Import the actual manager class handling the database state rotation
 from app.services.api_key_manager import SupabaseKeyManager
 
 # Set seed for reproducible local language detection results
@@ -101,14 +101,13 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
 
     full_prompt = f"========== KNOWLEDGE BASE ==========\n{knowledge_block}\n\n========== USER QUESTION ==========\n{user_query}"
 
-    # FIXED: Resolve client using the manager instance wrapper method
+    # Resolve client using the manager instance wrapper method
     groq_client = None
     if key_manager:
         try:
-            # Adjust method name if your class exposes it differently (e.g., key_manager.get_client())
             groq_client = key_manager.get_groq_client() 
         except Exception as e:
-            logger.error(f"[{request_id}] Failed to acquire rotated Groq client: {str(e)}")
+            logger.error(f"[{request_id}] Failed to acquire rotated Groq client from pool: {str(e)}")
 
     if not groq_client:
         return {
@@ -144,13 +143,21 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         success = False
         error_type = "AuthenticationError"
         answer = "I am currently facing authentication issues logging into my backend network."
-        # If your manager has a mark_as_exhausted or error callback, trigger it here:
-        # key_manager.mark_key_exhausted()
+        
+        # HOOK INTO LOOP: Instantly flag this specific key as exhausted in Supabase
+        if key_manager:
+            logger.warning(f"[{request_id}] Authentication failed. Dropping key from loop rotation...")
+            key_manager.handle_quota_exhausted()
         
     except groq.RateLimitError:
         success = False
         error_type = "RateLimitError"
         answer = "Our servers are experiencing heavy traffic. Please wait a minute and try asking again."
+        
+        # HOOK INTO LOOP: If a key hits its token/request ceiling, cycle it out immediately
+        if key_manager:
+            logger.warning(f"[{request_id}] Rate limit breached. Cycling out this API key...")
+            key_manager.handle_quota_exhausted()
         
     except Exception as e:
         success = False
@@ -158,7 +165,7 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         answer = "An unexpected error occurred while compiling your financial response guidance."
 
     elapsed_time = round(time.time() - start_time, 3)
-    logger.info(f"Req ID: {request_id} | Model: {MODEL_NAME} | Latency: {elapsed_time}s | Success: {success}")
+    logger.info(f"Req ID: {request_id} | Model: {MODEL_NAME} | Latency: {elapsed_time}s | Success: {success} | Error: {error_type}")
 
     return {
         "request_id": request_id,
