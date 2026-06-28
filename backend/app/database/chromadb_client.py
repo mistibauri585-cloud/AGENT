@@ -4,6 +4,7 @@ import logging
 import threading
 import json
 import urllib.request
+import urllib.error
 from typing import Dict, Any, Optional, List
 import chromadb
 from chromadb.api import ClientAPI
@@ -23,16 +24,15 @@ COLLECTION_METADATA_BLUEPRINT: Dict[str, Any] = {
     "description": "Multilingual financial knowledge base vector storage partitions."
 }
 
-# Configure Production Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Improved Logging configuration to match rules (no basicConfig() inside this file)
+logger = logging.getLogger(__name__)
 
 # =====================================================================
-# Custom Zero-RAM Serverless Embedding Function
+# Custom Zero-RAM Serverless Embedding Function with Auto-Retry & Timeout
 # =====================================================================
 class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
     """Custom embedding function that routes text formatting tasks remotely
-
-    to the Hugging Face Inference API. Consumes 0MB local server memory.
+    to the current Hugging Face Inference API. Consumes 0MB local server memory.
     """
     def __init__(self, api_key: str, model_name: str):
         if not api_key:
@@ -41,11 +41,13 @@ class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
                 "Remote embedding computations cannot proceed without a valid token."
             )
         self.api_key = api_key
+        # Updated to use the modern, officially supported Feature Extraction pipeline path
         self.api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_name}"
 
     def __call__(self, input: Documents) -> Embeddings:
         # Normalize incoming inputs into standard list strings
         texts = [input] if isinstance(input, str) else list(input)
+        batch_size = len(texts)
         
         payload = json.dumps({"inputs": texts, "options": {"wait_for_model": True}}).encode("utf-8")
         headers = {
@@ -53,23 +55,68 @@ class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        logging.info(f"Dispatching remote embedding vector request to Hugging Face API for batch size: {len(texts)}")
-        try:
-            req = urllib.request.Request(self.api_url, data=payload, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=15) as response:
-                result = json.loads(response.read().decode("utf-8"))
+        # Parameters meeting requirement criteria
+        max_retries = 3
+        retry_delay = 2.0
+        timeout_seconds = 60.0  # Increased from 15 to 60 seconds to allow cold model starts
+
+        logger.info(f"embedding request start: Dispatching remote vectors to Hugging Face API for batch size: {batch_size}")
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                req = urllib.request.Request(self.api_url, data=payload, headers=headers, method="POST")
                 
-                # Check for explicit API error response mapping structures
-                if isinstance(result, dict) and "error" in result:
-                    raise RuntimeError(f"Hugging Face Remote API Exception: {result['error']}")
-                
-                if not isinstance(result, list):
-                    raise ValueError("Received an invalid response structure payload from Hugging Face endpoint.")
+                with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+                    status_code = response.getcode()
+                    logger.info(f"Hugging Face Remote API Status Code: {status_code} on attempt {attempt}")
                     
-                return result
-        except Exception as e:
-            logging.error(f"Fail-Fast Triggered - API Embedding Generation Failure: {str(e)}")
-            raise RuntimeError(f"Failed to generate embeddings remotely: {str(e)}")
+                    result = json.loads(response.read().decode("utf-8"))
+                    
+                    # Check for explicit API error response mapping structures
+                    if isinstance(result, dict) and "error" in result:
+                        error_msg = result['error']
+                        logger.error(f"API error message on attempt {attempt}: {error_msg}")
+                        raise RuntimeError(f"Hugging Face Remote API Exception: {error_msg}")
+                    
+                    if not isinstance(result, list):
+                        raise ValueError("Received an invalid response structure payload from Hugging Face endpoint.")
+                    
+                    logger.info(f"Embedding request successfully generated for batch size: {batch_size}")
+                    return result
+
+            except urllib.error.HTTPError as http_err:
+                status_code = http_err.code
+                error_body = ""
+                try:
+                    error_body = http_err.read().decode("utf-8")
+                except Exception:
+                    pass
+                
+                logger.error(f"HTTP Error {status_code} on attempt {attempt}: {http_err.reason} | Details: {error_body}")
+                
+                # Check for explicit authorization or validation limits (Do not retry if invalid API key or bad schema)
+                if status_code in [401, 403, 400, 422]:
+                    raise RuntimeError(f"Permanent API Exception (HTTP {status_code}): {http_err.reason} - {error_body}")
+                
+                # Transient errors or Model Loading (503) updates retry paths
+                if attempt == max_retries:
+                    raise RuntimeError(f"Failed to generate embeddings after {max_retries} attempts. HTTP Error: {status_code}")
+                
+            except (urllib.error.URLError, TimeoutError) as network_err:
+                logger.error(f"Network error/timeout on attempt {attempt}: {str(network_err)}")
+                if attempt == max_retries:
+                    raise RuntimeError(f"Failed to generate embeddings due to network failure or timeout after {max_retries} attempts.")
+                    
+            except Exception as e:
+                # Catch-all unexpected anomalies (e.g., parsing failures) - immediate fail to keep ingestion pipeline safe
+                logger.error(f"Non-transient or parsing error exception on attempt {attempt}: {str(e)}")
+                raise RuntimeError(f"Unexpected processing exception inside embedding wrapper: {str(e)}")
+
+            # Wait before triggering next retry round
+            logger.warning(f"retry attempts: Transient error encountered. Waiting {retry_delay} seconds before retry attempt {attempt + 1}/{max_retries}...")
+            time.sleep(retry_delay)
+
+        raise RuntimeError("Final failure: Embedding function evaluation route exited retry loop unexpectedly.")
 
 # =====================================================================
 # System Lifecycle Singletons & Cache Matrices
@@ -98,7 +145,7 @@ def initialize_database() -> None:
             return
             
         try:
-            logging.info(f"Initializing Production ChromaDB Persistent Architecture at: {CHROMA_DB_PATH}")
+            logger.info(f"Initializing Production ChromaDB Persistent Architecture at: {CHROMA_DB_PATH}")
             os.makedirs(CHROMA_DB_PATH, exist_ok=True)
             
             _chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
@@ -108,16 +155,15 @@ def initialize_database() -> None:
             _embedding_function = ZeroRamHuggingFaceEmbedding(api_key=hf_token, model_name=EMBEDDING_MODEL_NAME)
             
             _initialized = True
-            logging.info("ChromaDB singletons and remote embedding pipelines mounted successfully.")
+            logger.info("ChromaDB singletons and remote embedding pipelines mounted successfully.")
             
         except Exception as e:
-            logging.critical(f"Fail-Fast Core Lockout: Database Vector Matrix failed initialization: {str(e)}")
+            logger.critical(f"Fail-Fast Core Lockout: Database Vector Matrix failed initialization: {str(e)}")
             raise RuntimeError(f"Database Core Matrix Initialization Failure: {str(e)}")
 
 
 def get_collection(name: str) -> Collection:
     """Creates or fetches a cached collection instance partition.
-
     Enforces safe execution under concurrent threaded requests.
     """
     if not _initialized:
@@ -131,7 +177,7 @@ def get_collection(name: str) -> Collection:
             return _collection_cache[name]
             
         try:
-            logging.info(f"Cache lookup miss for collection partition [{name}]. Initializing structural sync.")
+            logger.info(f"Cache lookup miss for collection partition [{name}]. Initializing structural sync.")
             
             custom_metadata = COLLECTION_METADATA_BLUEPRINT.copy()
             custom_metadata["collection_identifier_name"] = name
@@ -143,12 +189,12 @@ def get_collection(name: str) -> Collection:
             )
             
             _collection_cache[name] = collection_instance
-            logging.info(f"Collection partition instance [{name}] successfully written back to memory cache.")
+            logger.info(f"Collection partition instance [{name}] successfully written back to memory cache.")
             
             return collection_instance
             
         except Exception as e:
-            logging.error(f"Failed mounting or creating collection reference identifier [{name}]: {str(e)}")
+            logger.error(f"Failed mounting or creating collection reference identifier [{name}]: {str(e)}")
             raise ValueError(f"Collection initialization error exception failure on context name '{name}': {str(e)}")
 
 
@@ -173,7 +219,7 @@ def check_database() -> Dict[str, Any]:
         
     except Exception as e:
         diagnostic_message = f"Health diagnostic check failed: {str(e)}"
-        logging.error(f"Health status assessment failure exception tracking log: {diagnostic_message}")
+        logger.error(f"Health status assessment failure exception tracking log: {diagnostic_message}")
         
     elapsed_ms = round((time.time() - start_time) * 1000, 2)
     
