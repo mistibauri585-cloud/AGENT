@@ -1,18 +1,18 @@
 import time
-import logging
 import uuid
+import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import groq
 from langdetect import detect, DetectorFactory
-# 5. Clean Architectural Import: Relies on api_key_manager for client state
-from app.services.api_key_manager import _get_groq_client
+# FIXED: Clean Architectural Import using the correct public token rotation function
+from app.services.api_key_manager import get_groq_client
 
 # Set seed for reproducible local language detection results
 DetectorFactory.seed = 0
 
-# 8. Production Logging Configuration (Tracks metadata without bleeding sensitive text context)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [Req: %(pathname)s] - %(message)s")
+# FIXED: Removed logging.basicConfig to prevent breaking the global logger configuration in main.py
+logger = logging.getLogger(__name__)
 
 # =====================================================================
 # MODEL CONFIGURATION & CONTEXT CONSTANTS
@@ -27,7 +27,7 @@ MAX_CONTEXT_CHUNKS = 5
 MAX_CONTEXT_CHAR_LIMIT = 8000 
 
 # =====================================================================
-# 2. SUPPORTED MULTILINGUAL LOCAL MATRIX
+# SUPPORTED MULTILINGUAL LOCAL MATRIX
 # =====================================================================
 LANGUAGE_MAP = {
     "en": "English",
@@ -45,7 +45,7 @@ LANGUAGE_MAP = {
 
 
 def _detect_language_locally(text: str) -> str:
-    """2. Analyzes user strings locally on CPU using ISO maps to save API costs.
+    """Analyzes user strings locally on CPU using ISO maps to save API costs.
     
     Defaults cleanly to English if detection bounds fail.
     """
@@ -57,7 +57,7 @@ def _detect_language_locally(text: str) -> str:
 
 
 def _process_context(raw_context: Any) -> str:
-    """3. Validates incoming chunks, protects token bounds, and handles truncations 
+    """Validates incoming chunks, protects token bounds, and handles truncations 
     to insulate Groq against token inflation.
     """
     if not raw_context:
@@ -76,17 +76,17 @@ def _process_context(raw_context: Any) -> str:
 
 
 # =====================================================================
-# 1. CORE LLM GENERATION WORKSPACE (SINGLE RESPONSIBILITY ENGINE)
+# CORE LLM GENERATION WORKSPACE (SINGLE RESPONSIBILITY ENGINE)
 # =====================================================================
 def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]:
-    """6. Formulates system-instructions and routes operational prompts over Groq client bindings.
+    """Formulates system-instructions and routes operational prompts over Groq client bindings.
     
     Strict Design Boundary: Has no exposure to core DB queries, Whisper audio strings, 
     Redis, or client credentials. Expects clean runtime strings.
     """
     start_time = time.time()
     
-    # 9. Traceability tracking properties instantiation
+    # Traceability tracking properties instantiation
     request_id = str(uuid.uuid4())
     timestamp_str = datetime.now(timezone.utc).isoformat()
     
@@ -110,7 +110,7 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         )
         knowledge_block = clean_context
 
-    # 4. Prompt Engineering System Instruction Blueprint
+    # Prompt Engineering System Instruction Blueprint
     system_instruction = (
         "You are 'Appna Bank AI', a warm financial companion for farmers, students, and rural communities.\n\n"
         "RESPONSE RULES:\n"
@@ -137,8 +137,8 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
     error_type = None
     answer = ""
 
-    # 5. Delegate Client Construction Lifecycle to separate service
-    groq_client = _get_groq_client()
+    # Delegate Client Construction Lifecycle to separate service rotation key manager
+    groq_client = get_groq_client()
     if not groq_client:
         return {
             "request_id": request_id,
@@ -152,7 +152,7 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         }
 
     try:
-        # 6. Execute core operational transaction payload over Groq client wrapper
+        # Execute core operational transaction payload over Groq client wrapper
         response = groq_client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -166,7 +166,7 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         )
         answer = response.choices[0].message.content
 
-    # 7. Comprehensive Error Routing Context Mapping (Returns user-friendly alerts)
+    # Comprehensive Error Routing Context Mapping (Returns user-friendly alerts)
     except groq.AuthenticationError:
         success = False
         error_type = "AuthenticationError"
@@ -194,13 +194,13 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
 
     elapsed_time = round(time.time() - start_time, 3)
 
-    # 8. Clean Audit Metric Tracking Log Call (Excludes prompts and customer queries)
-    logging.info(
+    # Clean Audit Metric Tracking Log Call (Excludes prompts and customer queries)
+    logger.info(
         f"Req ID: {request_id} | Model: {MODEL_NAME} | Lang: {detected_language} | "
         f"Latency: {elapsed_time}s | Success: {success} | Error Type: {error_type}"
     )
 
-    # 9. Standardized Structural Analytics Response Payload Object Frame Output
+    # Standardized Structural Analytics Response Payload Object Frame Output
     return {
         "request_id": request_id,
         "timestamp": timestamp_str,
