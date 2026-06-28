@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 try:
     key_manager = SupabaseKeyManager()
 except Exception as e:
-    logger.critical(f"Failed to instantiate SupabaseKeyManager: {str(e)}")
+    logger.critical(f"Failed to instantiate SupabaseKeyManager: {str(e)}", exc_info=True)
     key_manager = None
 
 # =====================================================================
@@ -107,7 +107,7 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         try:
             groq_client = key_manager.get_groq_client() 
         except Exception as e:
-            logger.error(f"[{request_id}] Failed to acquire rotated Groq client from pool: {str(e)}")
+            logger.error(f"[{request_id}] Failed to acquire rotated Groq client from pool: {str(e)}", exc_info=True)
 
     if not groq_client:
         return {
@@ -139,22 +139,22 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         )
         answer = response.choices[0].message.content
 
-    except groq.AuthenticationError:
+    except groq.AuthenticationError as auth_err:
         success = False
         error_type = "AuthenticationError"
         answer = "I am currently facing authentication issues logging into my backend network."
+        logger.error(f"[{request_id}] Groq Authentication Failure: {str(auth_err)}")
         
-        # HOOK INTO LOOP: Instantly flag this specific key as exhausted in Supabase
         if key_manager:
             logger.warning(f"[{request_id}] Authentication failed. Dropping key from loop rotation...")
             key_manager.handle_quota_exhausted()
         
-    except groq.RateLimitError:
+    except groq.RateLimitError as rate_err:
         success = False
         error_type = "RateLimitError"
         answer = "Our servers are experiencing heavy traffic. Please wait a minute and try asking again."
+        logger.warning(f"[{request_id}] Groq Rate Limit Encountered: {str(rate_err)}")
         
-        # HOOK INTO LOOP: If a key hits its token/request ceiling, cycle it out immediately
         if key_manager:
             logger.warning(f"[{request_id}] Rate limit breached. Cycling out this API key...")
             key_manager.handle_quota_exhausted()
@@ -163,6 +163,7 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         success = False
         error_type = f"UnexpectedError: {type(e).__name__}"
         answer = "An unexpected error occurred while compiling your financial response guidance."
+        logger.error(f"[{request_id}] Unexpected exception caught in synthesis layer: {str(e)}", exc_info=True)
 
     elapsed_time = round(time.time() - start_time, 3)
     logger.info(f"Req ID: {request_id} | Model: {MODEL_NAME} | Latency: {elapsed_time}s | Success: {success} | Error: {error_type}")
