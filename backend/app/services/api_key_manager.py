@@ -3,9 +3,10 @@ import logging
 from typing import Optional
 from datetime import datetime, timezone
 from supabase import create_client, Client
+import groq
 
-# Configure production logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [Key Manager] - %(message)s")
+# Use structural logging (Avoid calling basicConfig here so it doesn't collide with main.py)
+logger = logging.getLogger(__name__)
 
 class SupabaseKeyManager:
     def __init__(self):
@@ -17,7 +18,7 @@ class SupabaseKeyManager:
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
         
         if not supabase_url or not supabase_key:
-            logging.critical("Missing Supabase credentials in environment variables!")
+            logger.critical("Missing Supabase credentials in environment variables!")
             self.supabase: Optional[Client] = None
         else:
             self.supabase = create_client(supabase_url, supabase_key)
@@ -31,7 +32,7 @@ class SupabaseKeyManager:
         This creates an infinite cyclic queue when exhausted keys are reset to active.
         """
         if not self.supabase:
-            logging.error("Supabase client is not initialized.")
+            logger.error("Supabase client is not initialized.")
             return None
 
         try:
@@ -48,10 +49,10 @@ class SupabaseKeyManager:
             if data and len(data) > 0:
                 self._active_key_id = data[0]["id"]
                 self._active_key = data[0]["api_key"].strip()
-                logging.info(f"Cyclic Loop -> Loaded oldest active key ID: {self._active_key_id}")
+                logger.info(f"Cyclic Loop -> Loaded oldest active key ID: {self._active_key_id}")
                 
                 # Instantly stamp the current time. This pushes this key to the back of the line 
-                # for the next transaction, ensuring all 5 keys share the traffic equally.
+                # for the next transaction, ensuring all keys share the traffic equally.
                 try:
                     self.supabase.table("groq_api_keys").update(
                         {
@@ -62,17 +63,17 @@ class SupabaseKeyManager:
                         self._active_key_id
                     ).execute()
                 except Exception as update_err:
-                    logging.error(f"Non-fatal error pushing key to back of usage queue: {str(update_err)}")
+                    logger.error(f"Non-fatal error pushing key to back of usage queue: {str(update_err)}")
                 
                 return self._active_key
             else:
-                logging.critical("!!! ALL REGISTERED API KEYS ARE EXHAUSTED !!! Waiting for manual dashboard reset.")
+                logger.critical("!!! ALL REGISTERED API KEYS ARE EXHAUSTED !!! Waiting for manual dashboard reset.")
                 self._active_key = None
                 self._active_key_id = None
                 return None
                 
         except Exception as e:
-            logging.error(f"Error executing dynamic key query rotation loop: {str(e)}")
+            logger.error(f"Error executing dynamic key query rotation loop: {str(e)}")
             return None
 
     def get_active_key(self) -> Optional[str]:
@@ -81,18 +82,35 @@ class SupabaseKeyManager:
             return self.refresh_keys_from_db()
         return self._active_key
 
+    def get_groq_client(self) -> Optional[groq.Groq]:
+        """
+        FIXED: Dynamically wraps the loaded active rotated key string into an initialized 
+        Groq client instance requested by the text/voice generation layer.
+        """
+        api_key = self.get_active_key()
+        if not api_key:
+            logger.error("Cannot initialize Groq client: No active API keys available.")
+            return None
+        
+        try:
+            # Instantiates Groq SDK instance using current pool token parameter
+            return groq.Groq(api_key=api_key)
+        except Exception as e:
+            logger.error(f"Failed initialization wrapper layout of Groq client SDK: {str(e)}")
+            return None
+
     def handle_quota_exhausted(self) -> Optional[str]:
         """
         Flags the broken key as 'exhausted' with a timestamp, clears local cache,
         and instantly pops the next waiting active key from the queue.
         """
         if not self.supabase or not self._active_key_id:
-            logging.error("Cannot rotate key: Database offline or no tracking state loaded.")
+            logger.error("Cannot rotate key: Database offline or no tracking state loaded.")
             return None
 
         try:
             bad_id = self._active_key_id
-            logging.warning(f"Quota Exhausted for Key ID [{bad_id}]. Drop-flagging in Supabase...")
+            logger.warning(f"Quota Exhausted for Key ID [{bad_id}]. Drop-flagging in Supabase...")
 
             # Take the key out of the active loop rotation instantly
             self.supabase.table("groq_api_keys").update(
@@ -113,6 +131,6 @@ class SupabaseKeyManager:
             return self.refresh_keys_from_db()
 
         except Exception as e:
-            logging.error(f"Failed to isolate exhausted key status in Supabase: {str(e)}")
+            logger.error(f"Failed to isolate exhausted key status in Supabase: {str(e)}")
             self._active_key = None
             return None
