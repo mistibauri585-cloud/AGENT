@@ -55,10 +55,10 @@ class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        # Parameters meeting requirement criteria
+        # Parameters meeting requirement criteria precisely
         max_retries = 3
-        retry_delay = 2.0
-        timeout_seconds = 60.0  # Increased from 15 to 60 seconds to allow cold model starts
+        backoff_delays = [1.0, 2.0, 4.0]  # Exponential backoff array sequence
+        timeout_seconds = 30.0            # Calibrated exactly to 30s timeout parameters
 
         logger.info(f"embedding request start: Dispatching remote vectors to Hugging Face API for batch size: {batch_size}")
 
@@ -92,7 +92,8 @@ class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
                 except Exception:
                     pass
                 
-                logger.error(f"HTTP Error {status_code} on attempt {attempt}: {http_err.reason} | Details: {error_body}")
+                # Logs both the HTTP status code and response body when Hugging Face returns an error
+                logger.error(f"HTTP Error {status_code} on attempt {attempt}: {http_err.reason} | Response Body: {error_body}")
                 
                 # Check for explicit authorization or validation limits (Do not retry if invalid API key or bad schema)
                 if status_code in [401, 403, 400, 422]:
@@ -112,9 +113,10 @@ class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
                 logger.error(f"Non-transient or parsing error exception on attempt {attempt}: {str(e)}")
                 raise RuntimeError(f"Unexpected processing exception inside embedding wrapper: {str(e)}")
 
-            # Wait before triggering next retry round
-            logger.warning(f"retry attempts: Transient error encountered. Waiting {retry_delay} seconds before retry attempt {attempt + 1}/{max_retries}...")
-            time.sleep(retry_delay)
+            # Wait using explicit exponential backoff scale (1s, 2s, 4s)
+            current_delay = backoff_delays[attempt - 1]
+            logger.warning(f"Transient error encountered. Waiting {current_delay} seconds before retry attempt {attempt + 1}/{max_retries}...")
+            time.sleep(current_delay)
 
         raise RuntimeError("Final failure: Embedding function evaluation route exited retry loop unexpectedly.")
 
