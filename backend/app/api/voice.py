@@ -1,18 +1,21 @@
 import time
 import logging
+import io
 from datetime import datetime, timezone
-from fastapi import APIRouter, UploadFile, File, HTTPException, status
+from fastapi import APIRouter, UploadFile, File, status
 from pydantic import BaseModel, Field
 
 # Strict Orchestration Imports - Reusing your production single-responsibility services
-from app.services import whisper_service, redis_cache, llm_service
-# Note: Ensure rag_pipeline exposes 'search_bookshelf' or adjust to your exact retrieval method name
-from app.services import rag_pipeline 
+from app.services import whisper_service, redis_cache, llm_service, rag_pipeline 
+from app.services.api_key_manager import SupabaseKeyManager
 
 # Configure production logging format
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [Voice Router] - %(message)s")
 
 router = APIRouter(prefix="/api/v1", tags=["Voice Orchestration"])
+
+# Instantiating the Key Manager to safely handle manual fallback rotations if needed
+key_manager = SupabaseKeyManager()
 
 # =====================================================================
 # RESPONSE SCHEMA DEFINITION
@@ -39,7 +42,6 @@ async def process_voice_query(audio_file: UploadFile = File(...)) -> VoiceRespon
     (If Hit: Return) -> (If Miss: RAG Context Retrieval -> LLM Generation -> Cache Save -> Return)
     """
     start_time = time.time()
-    timestamp_str = datetime.now(timezone.utc).isoformat()
     
     # 1. Pre-flight Validation of Upload Components
     if not audio_file or not audio_file.filename:
@@ -64,11 +66,9 @@ async def process_voice_query(audio_file: UploadFile = File(...)) -> VoiceRespon
         return _build_error_response(validation["message"], start_time)
 
     # 3. Step 1: Speech-to-Text via Whisper Service
-    import io
     audio_stream = io.BytesIO(audio_bytes)
     
     try:
-        # Synchronous execution wrapped within async router environment bindings
         whisper_result = whisper_service.transcribe_audio(audio_stream, filename, content_type)
     except Exception as e:
         logging.error(f"Cascading crash intercepted at whisper_service processing boundary: {str(e)}")
@@ -82,7 +82,6 @@ async def process_voice_query(audio_file: UploadFile = File(...)) -> VoiceRespon
     question_text = whisper_result.get("transcription", "").strip()
     request_id = whisper_result.get("request_id", "unknown-trace")
 
-    # Double check for empty transcription anomalies
     if not question_text:
         logging.warning(f"[Req: {request_id}] Whisper returned empty textual string content parameters.")
         return _build_error_response("No speech detected.", start_time, question=question_text)
@@ -107,13 +106,11 @@ async def process_voice_query(audio_file: UploadFile = File(...)) -> VoiceRespon
                     timestamp=datetime.now(timezone.utc).isoformat()
                 )
     except Exception as cache_err:
-        # Rule Compliance: Redis degradation logs the failure but does NOT stop request generation
         logging.error(f"[Req: {request_id}] Graceful suppression: Redis cache extraction error caught: {str(cache_err)}")
 
     # 5. Step 3: Knowledge Base Context Retrieval via RAG Pipeline
     logging.info(f"[Req: {request_id}] Production Cache MISS. Initiating RAG vector retrieval pipeline.")
     try:
-        # Coordinates retrieval by calling your designated search method
         retrieved_context = rag_pipeline.search_bookshelf(question_text)
     except Exception as rag_err:
         logging.error(f"[Req: {request_id}] RAG subsystem threw an execution error exception: {str(rag_err)}")
@@ -122,6 +119,18 @@ async def process_voice_query(audio_file: UploadFile = File(...)) -> VoiceRespon
     # 6. Step 4: Text Generation via single-responsibility LLM Service
     try:
         llm_response = llm_service.ask_the_principal(question_text, retrieved_context)
+        
+        # FIXED: Catch key exhaustion hidden inside unsuccessful dictionary payload responses
+        if not llm_response.get("success") and "Authentication" not in llm_response.get("answer", ""):
+            logging.warning(f"[Req: {request_id}] LLM Generation failed on active key. Triggering automatic fallback rotation...")
+            
+            # Drop the current key state out of circulation completely in Supabase
+            key_manager.handle_quota_exhausted()
+            
+            # Immediately invoke a seamless second-pass execution with the next active key queue item
+            logging.info(f"[Req: {request_id}] Retrying generation with fresh cyclic queue worker...")
+            llm_response = llm_service.ask_the_principal(question_text, retrieved_context)
+
     except Exception as llm_err:
         logging.error(f"[Req: {request_id}] LLM answer generation subsystem threw a fatal error: {str(llm_err)}")
         return _build_error_response("Answer generation service experienced a platform timeout error.", start_time, question=question_text)
@@ -130,15 +139,14 @@ async def process_voice_query(audio_file: UploadFile = File(...)) -> VoiceRespon
     final_timestamp = datetime.now(timezone.utc).isoformat()
 
     # 7. Step 5: Enforce Cache Policies and Commit Successful Transactions
+    # FIXED: Prevents caching error text payloads into your production Redis instances
     if llm_response.get("success") and str(llm_response.get("answer")).strip():
         try:
             if cache_key:
-                # Store the standard payload matching your exact schema specifications
                 redis_cache.set(cache_key, llm_response)
         except Exception as cache_set_err:
             logging.error(f"[Req: {request_id}] Safe bypass: Failed committing new success key records to Redis: {str(cache_set_err)}")
 
-    # 8. Log Request Transaction Signatures (Omitting keys, prompts, or binary audio context)
     logging.info(
         f"[Req: {request_id}] Total Processing Complete -> Format: {filename.split('.')[-1]} | "
         f"Total Latency: {elapsed_time}s | Pipeline Success: {llm_response.get('success', False)}"
