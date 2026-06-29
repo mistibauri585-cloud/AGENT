@@ -1,3 +1,4 @@
+# backend/app/services/rag/pipeline.py
 import os
 import time
 import uuid
@@ -6,12 +7,22 @@ import logging
 import urllib.request
 import urllib.error
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pypdf import PdfReader
 # Configuration and retrieval initialization client wrapper from your database module
 from app.database.chromadb_client import get_collection
+
+# Import the new PDF loader requested for Supabase tracking integrations
+from app.services.pdf_loader import (
+    download_pdfs_from_supabase,
+    cleanup_temp_pdfs
+)
+
+# Import centralized Tavily service execution engine
+from app.services.tavily_service import search_the_web
 
 # Configure production module-scoped logger (No basicConfig overrides)
 logger = logging.getLogger(__name__)
@@ -100,138 +111,191 @@ def extract_pdf_pages(pdf_path: str) -> List[Dict[str, Any]]:
                         "text": text
                     })
             except Exception as page_err:
-                logger.error(f"Error parsing page {idx + 1} within file {pdf_path}: {str(page_err)}")
+                logger.exception(f"Error parsing page {idx + 1} within file {pdf_path}: {str(page_err)}")
     except Exception as e:
-        logger.error(f"Failed handling parsing pipeline sequence on file {pdf_path}: {str(e)}")
+        logger.exception(f"Failed handling parsing pipeline sequence on file {pdf_path}: {str(e)}")
     return pages_data
 
 
 def ingest_all_pdfs_from_folder(folder_path: str = "pdfs", language: str = "English", category: str = "banking", topic: str = "general", version: str = "1.0.0") -> str:
-    """Ingests filesystem PDF binaries directly inside configured target partitions with rich metadata.
+    """Ingests filesystem PDF binaries directly inside configured target partitions with rich metadata."""
+    start_ingestion_time = time.time()
     
-    Optimized: Implements high-performance batch duplicate validation and robust, isolated 
-    exponential backoff retry blocks around data creation matrices.
-    """
-    folder = Path(folder_path)
-    if not folder.exists():
-        folder.mkdir(parents=True, exist_ok=True)
-        return "Created directory structure workspace. Seed target data objects."
-        
-    pdf_files = list(folder.glob("*.pdf"))
-    if not pdf_files:
-        return "No processable raw file data types detected inside file directory workspace bounds."
+    # Initialize metric collection counters
+    stats = {
+        "downloaded_pdfs": 0,
+        "processed_pdfs": 0,
+        "total_pages": 0,
+        "chunks_created": 0,
+        "duplicates_skipped": 0,
+        "failed_chunks": 0,
+        "total_retries": 0
+    }
 
     collection_name = COLLECTION_ROUTING.get(language, COLLECTION_ROUTING["default"])
-    collection = _get_cached_or_fresh_collection(collection_name)
-    
     total_chunks = 0
     total_files = 0
+    pdf_files: List[Any] = []
 
-    for pdf_file in pdf_files:
+    try:
+        # Wrap Supabase operations internally within the master try-finally logic tree
         try:
-            logger.info(f"Beginning ingestion tracking execution for PDF: {pdf_file.name}")
-            file_size_kb = round(os.path.getsize(pdf_file) / 1024, 2)
-            pages_extracted = extract_pdf_pages(str(pdf_file))
-            
-            if not pages_extracted:
-                logger.warning(f"Document '{pdf_file.name}' returned an empty layout payload string. Skipping.")
-                continue
-            
-            # --- PHASE 1: PRE-COMPILE ALL CHUNKS AND TARGET IDS FOR BATCH DISCOVERY ---
-            staged_chunks = []
-            all_staged_ids = []
-            
-            for page_obj in pages_extracted:
-                p_num = page_obj["page_number"]
-                chunks = split_text_into_chunks(page_obj["text"])
-                
-                for idx, chunk in enumerate(chunks):
-                    content_hash = generate_content_hash(chunk)
-                    chunk_id = f"doc_{pdf_file.stem}_p{p_num}_{idx}_{content_hash[:12]}"
-                    
-                    staged_chunks.append({
-                        "id": chunk_id,
-                        "text": chunk,
-                        "page_number": p_num,
-                        "chunk_number": idx,
-                        "hash": content_hash
-                    })
-                    all_staged_ids.append(chunk_id)
-            
-            if not all_staged_ids:
-                continue
+            logger.info("Downloading PDFs from Supabase Storage...")
+            download_start = time.time()
+            pdf_files = download_pdfs_from_supabase()
+            download_time = round(time.time() - download_start, 2)
+            stats["downloaded_pdfs"] = len(pdf_files)
+            logger.info(f"Downloaded {len(pdf_files)} PDFs in {download_time} seconds.")
+        except Exception as supabase_download_err:
+            logger.exception(f"Failed pulling asset configurations from Supabase remote bucket source: {str(supabase_download_err)}")
+            return f"Supabase Ingestion Interruption: {str(supabase_download_err)}"
 
-            # --- PHASE 2: BATCH DUPLICATE DETECTION (SINGLE ROUND-TRIP OVERHEAD) ---
-            existing_ids = set()
+        if not pdf_files:
+            logger.warning("No PDFs found in Supabase Storage.")
+            return "No PDFs found in Supabase Storage."
+
+        collection = _get_cached_or_fresh_collection(collection_name)
+
+        for pdf_file_path in pdf_files:
+            pdf_file = Path(pdf_file_path)
             try:
-                # Retrieve existing matching IDs inside this batch window
-                existing_records = collection.get(ids=all_staged_ids)
-                if existing_records and existing_records.get("ids"):
-                    existing_ids = set(existing_records["ids"])
-            except Exception as batch_check_err:
-                logger.warning(f"Batch duplication validation lookup failed, defaulting to safe append path: {str(batch_check_err)}")
-
-            # --- PHASE 3: PROCESS, INDEX AND RETRY NEW CHUNKS EXCLUSIVELY ---
-            for chunk_data in staged_chunks:
-                c_id = chunk_data["id"]
+                logger.info(f"Beginning ingestion tracking execution for PDF: {pdf_file.name}")
+                file_size_kb = round(os.path.getsize(pdf_file) / 1024, 2)
+                pages_extracted = extract_pdf_pages(str(pdf_file))
                 
-                # Deduplicate immediately against our generated batch index set
-                if c_id in existing_ids:
+                if not pages_extracted:
+                    logger.warning(f"Document '{pdf_file.name}' returned an empty layout payload string. Skipping.")
                     continue
                 
-                # Wrap creation matrices with exponential backoff retry guidelines
-                max_retries = 3
-                success = False
-                backoff_delays = [1.0, 2.0, 4.0]
+                stats["total_pages"] += len(pages_extracted)
                 
-                for attempt in range(1, max_retries + 1):
-                    try:
-                        collection.add(
-                            ids=[c_id],
-                            documents=[chunk_data["text"]],
-                            metadatas=[{
-                                "source": pdf_file.name,
-                                "source_type": "pdf",
-                                "language": language,
-                                "category": category,
-                                "topic": topic,
-                                "document_version": version,
-                                "page_number": chunk_data["page_number"],
-                                "chunk_number": chunk_data["chunk_number"],
-                                "hash": chunk_data["hash"],
-                                "file_size_kb": file_size_kb,
-                                "timestamp": str(time.time())
-                            }]
-                        )
-                        success = True
-                        if attempt > 1:
-                            logger.info(f"Success after retry: Chunk [{c_id}] written successfully on attempt {attempt}.")
-                        break
-                    except Exception as add_err:
-                        logger.warning(
-                            f"Retry attempt {attempt} failed writing chunk {chunk_data['chunk_number']} "
-                            f"on page {chunk_data['page_number']} for PDF '{pdf_file.name}'. Error: {str(add_err)}"
-                        )
-                        if attempt < max_retries:
-                            time.sleep(backoff_delays[attempt - 1])
-                        else:
-                            # Final failure tracking log mapping capture
-                            logger.error(
-                                f"Final failure reason: All {max_retries} indexing operations exhausted for chunk "
-                                f"#{chunk_data['chunk_number']} on page {chunk_data['page_number']} of PDF '{pdf_file.name}'. "
-                                f"Exception Details: {str(add_err)}", exc_info=True
+                # --- PHASE 1: PRE-COMPILE ALL CHUNKS AND TARGET IDS FOR BATCH DISCOVERY ---
+                staged_chunks = []
+                all_staged_ids = []
+                
+                for page_obj in pages_extracted:
+                    p_num = page_obj["page_number"]
+                    chunks = split_text_into_chunks(page_obj["text"])
+                    
+                    for idx, chunk in enumerate(chunks):
+                        content_hash = generate_content_hash(chunk)
+                        chunk_id = f"doc_{pdf_file.stem}_p{p_num}_{idx}_{content_hash[:12]}"
+                        
+                        staged_chunks.append({
+                            "id": chunk_id,
+                            "text": chunk,
+                            "page_number": p_num,
+                            "chunk_number": idx,
+                            "hash": content_hash
+                        })
+                        all_staged_ids.append(chunk_id)
+                
+                if not all_staged_ids:
+                    continue
+
+                # --- PHASE 2: BATCH DUPLICATE DETECTION (SINGLE ROUND-TRIP OVERHEAD) ---
+                existing_ids = set()
+                try:
+                    existing_records = collection.get(ids=all_staged_ids)
+                    if existing_records and existing_records.get("ids"):
+                        existing_ids = set(existing_records["ids"])
+                except Exception as batch_check_err:
+                    logger.warning(f"Batch duplication validation lookup failed, defaulting to safe append path: {str(batch_check_err)}")
+
+                # --- PHASE 3: PROCESS, INDEX AND RETRY NEW CHUNKS EXCLUSIVELY ---
+                total_staged_count = len(staged_chunks)
+                for loop_idx, chunk_data in enumerate(staged_chunks, start=1):
+                    c_id = chunk_data["id"]
+                    
+                    # Deduplicate immediately against our generated batch index set
+                    if c_id in existing_ids:
+                        stats["duplicates_skipped"] += 1
+                        continue
+                    
+                    # Prevent inserting blank configurations into vector instances
+                    if not chunk_data["text"].strip():
+                        continue
+
+                    # Reduced railway infrastructure console logging severity
+                    logger.debug(
+                        f"Adding chunk {loop_idx}/{total_staged_count} | Source: {pdf_file.name} | "
+                        f"Page: {chunk_data['page_number']} | Collection: {collection_name}"
+                    )
+                    
+                    max_retries = 3
+                    success = False
+                    backoff_delays = [1.0, 2.0, 4.0]
+                    
+                    for attempt in range(1, max_retries + 1):
+                        try:
+                            if attempt > 1:
+                                logger.info(f"Retry {attempt}/{max_retries}...")
+                                stats["total_retries"] += 1
+                                
+                            collection.add(
+                                ids=[c_id],
+                                documents=[chunk_data["text"]],
+                                metadatas=[{
+                                    "source": pdf_file.name,
+                                    "source_type": "pdf",
+                                    "language": language,
+                                    "category": category,
+                                    "topic": topic,
+                                    "document_version": version,
+                                    "page_number": chunk_data["page_number"],
+                                    "chunk_number": chunk_data["chunk_number"],
+                                    "hash": chunk_data["hash"],
+                                    "file_size_kb": file_size_kb,
+                                    "timestamp": datetime.now(timezone.utc).isoformat()
+                                }]
                             )
+                            success = True
+                            logger.info("Chunk inserted successfully.")
+                            break
+                        except Exception as add_err:
+                            logger.warning(
+                                f"Retry attempt {attempt} failed writing chunk {chunk_data['chunk_number']} "
+                                f"on page {chunk_data['page_number']} for PDF '{pdf_file.name}'. Error: {str(add_err)}"
+                            )
+                            if attempt < max_retries:
+                                time.sleep(backoff_delays[attempt - 1])
+                            else:
+                                logger.error(f"Chunk permanently skipped after maximum retries.")
+                                stats["failed_chunks"] += 1
 
-                if success:
-                    total_chunks += 1
-            
-            total_files += 1
-            logger.info(f"Successfully finished processing document file data matrix: {pdf_file.name}")
+                    if success:
+                        total_chunks += 1
+                        stats["chunks_created"] += 1
+                
+                total_files += 1
+                stats["processed_pdfs"] += 1
+                logger.info(f"Successfully finished processing document file data matrix: {pdf_file.name}")
 
-        except Exception as file_err:
-            logger.error(f"Ingestion failure on file '{pdf_file.name}': {str(file_err)}", exc_info=True)
-            logger.warning("Isolating broken document chain. Moving to next available asset inside target directory pool...")
-            continue
+            except Exception as file_err:
+                logger.exception(f"Ingestion failure on file '{pdf_file.name}': {str(file_err)}")
+                logger.warning("Isolating broken document chain. Moving to next available asset inside target directory pool...")
+                continue
+                
+    finally:
+        logger.info("Cleaning temporary PDF directory...")
+        cleanup_temp_pdfs()
+        
+        elapsed_ingestion_time = round(time.time() - start_ingestion_time, 2)
+        
+        logger.info(
+            f"\n====================================================\n"
+            f"INGESTION SUMMARY\n"
+            f"----------------------------------------------------\n"
+            f"Downloaded PDFs: {stats['downloaded_pdfs']}\n"
+            f"Processed PDFs: {stats['processed_pdfs']}\n"
+            f"Pages: {stats['total_pages']}\n"
+            f"Chunks Created: {stats['chunks_created']}\n"
+            f"Duplicates Skipped: {stats['duplicates_skipped']}\n"
+            f"Failed Chunks: {stats['failed_chunks']}\n"
+            f"Retries: {stats['total_retries']}\n"
+            f"Elapsed Time: {elapsed_ingestion_time} seconds\n"
+            f"===================================================="
+        )
 
     return f"Ingested {total_files} files into {total_chunks} blocks inside target partition context [{collection_name}]."
 
@@ -267,6 +331,9 @@ def _query_single_collection(collection_name: str, query: str, n_results: int) -
     """Fetches precision vector segments using robust exception guards."""
     try:
         collection = _get_cached_or_fresh_collection(collection_name)
+        if collection is None:
+            return []
+            
         results = collection.query(query_texts=[query], n_results=n_results)
         
         extracted_chunks = []
@@ -289,8 +356,7 @@ def _query_single_collection(collection_name: str, query: str, n_results: int) -
             })
         return extracted_chunks
     except Exception as e:
-        # Returns empty list context tracking safely instead of crashing downstream flows
-        logger.error(f"ChromaDB extraction anomaly caught inside partition partition layer [{collection_name}]: {str(e)}")
+        logger.exception(f"ChromaDB extraction anomaly caught inside partition partition layer [{collection_name}]: {str(e)}")
         return []
 
 
@@ -335,49 +401,43 @@ def _preserve_neighboring_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str,
     return merged_chunks
 
 
-def _execute_tavily_web_search(query: str) -> str:
-    """Executes search updates using Tavily API layer when local vector hits miss thresholds limits."""
-    # Fix Tavily API Key Validation
-    tavily_api_key = os.getenv("TAVILY_API_KEY", "")
-    if not tavily_api_key or not tavily_api_key.strip():
-        return ""
-    try:
-        from tavily import TavilyClient
-        tavily = TavilyClient(api_key=tavily_api_key)
-        response = tavily.search(query=query, search_depth="basic", max_results=2)
-        
-        web_context_blocks = []
-        for result in response.get("results", []):
-            web_context_blocks.append(f"[Web Source: {result.get('url')}] {result.get('content')}")
-        return "\n\n".join(web_context_blocks)
-    except Exception as e:
-        logger.error(f"Fallback internet search routing encountered an exception: {str(e)}")
-        return ""
-
-
 # =====================================================================
 # RAG PIPELINE EXPORT INTERFACE ENTRY POINT
 # =====================================================================
 def search_bookshelf(query: str, detected_language: str = "English", n_results: int = MAX_CONTEXT_CHUNKS) -> Dict[str, Any]:
-    """Independent RAG Processing Pipeline Segment Interface Node Entry.
-    
-    Consolidated singleton routing station executing safe bounded threads
-    and processing single-execution global web lookups directly.
-    """
+    """Independent RAG Processing Pipeline Segment Interface Node Entry."""
     start_time = time.time()
     
     if not query or not query.strip():
         return {"found": False, "context": "", "source": "No Query Provided Target Parameters", "similarity_score": 0.0}
 
     target_collections = _determine_intent_collections(query, detected_language)
-    all_retrieved_chunks: List[Dict[str, Any]] = []
     
+    if not target_collections:
+        return {
+            "found": False,
+            "context": "",
+            "source": "No collections available",
+            "collection_name": None,
+            "similarity_score": 0.0,
+            "retrieved_chunk_count": 0,
+            "search_time": 0.0
+        }
+
+    all_retrieved_chunks: List[Dict[str, Any]] = []
     bounded_max_workers = max(1, len(target_collections))
     
-    with ThreadPoolExecutor(max_workers=bounded_max_workers) as executor:
-        futures = {executor.submit(_query_single_collection, col, query, n_results): col for col in target_collections}
-        for future in as_completed(futures):
-            all_retrieved_chunks.extend(future.result())
+    try:
+        with ThreadPoolExecutor(max_workers=bounded_max_workers) as executor:
+            futures = {executor.submit(_query_single_collection, col, query, n_results): col for col in target_collections}
+            for future in as_completed(futures):
+                try:
+                    all_retrieved_chunks.extend(future.result())
+                except Exception as individual_query_err:
+                    col_name = futures[future]
+                    logger.exception(f"Fault isolation active: Query trace thread collapsed processing partition [{col_name}]: {str(individual_query_err)}")
+    except Exception as pool_failure:
+        logger.exception(f"ThreadPoolExecutor processing pool crashed inside RAG pipeline: {str(pool_failure)}")
 
     # De-duplicate matching paragraph texts overlapping matrix segments 
     seen_contents = set()
@@ -387,6 +447,9 @@ def search_bookshelf(query: str, detected_language: str = "English", n_results: 
         if norm_text not in seen_contents:
             seen_contents.add(norm_text)
             unique_chunks.append(chunk)
+
+    # Impose a hard protection ceiling over raw retrieved arrays to mitigate memory bottlenecks
+    unique_chunks = unique_chunks[:20]
 
     unique_chunks.sort(key=lambda x: x["score"], reverse=True)
 
@@ -401,10 +464,10 @@ def search_bookshelf(query: str, detected_language: str = "English", n_results: 
     local_context_str = "\n\n".join([c["text"].strip() for c in processed_local_chunks[:MAX_CONTEXT_CHUNKS]])
     local_context_str = local_context_str[:MAX_CONTEXT_CHAR_LIMIT]
 
-    # Singleton execution point for Tavily fallback. Eliminates backend duplication loop trends.
+    # Singleton execution point for Tavily fallback via production service integration
     if not filtered_chunks or top_score < SIMILARITY_THRESHOLD:
         logger.info(f"RAG confidence ({top_score}) below threshold ({SIMILARITY_THRESHOLD}). Activating singleton Tavily fallback mapping loop.")
-        web_context = _execute_tavily_web_search(query)
+        web_context = search_the_web(query)
         
         if web_context:
             if local_context_str.strip():
@@ -423,9 +486,15 @@ def search_bookshelf(query: str, detected_language: str = "English", n_results: 
 
     elapsed_time = round(time.time() - start_time, 3)
     
+    # Combined production structured summary metrics console log statement
     logger.info(
-        f"RAG Search Complete -> Routed Collections: {target_collections} | Selected Source Node: {final_source} | "
-        f"Confidence Score: {top_score} | Processing Latency Delay: {elapsed_time}s"
+        f"RAG Search Performance Metrics Summary -> "
+        f"Routed Collections: {target_collections} | "
+        f"Collection Utilized: {collection_utilized} | "
+        f"Retrieved Chunks Count: {len(processed_local_chunks)} | "
+        f"Similarity Score Threshold: {top_score} | "
+        f"Processing Execution Latency: {elapsed_time}s | "
+        f"Final Match Source Destination: {final_source}"
     )
 
     return {
