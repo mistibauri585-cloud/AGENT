@@ -1,3 +1,4 @@
+# backend/app/services/llm_service.py
 import time
 import uuid
 import logging
@@ -101,73 +102,110 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
 
     full_prompt = f"========== KNOWLEDGE BASE ==========\n{knowledge_block}\n\n========== USER QUESTION ==========\n{user_query}"
 
-    # Resolve client using the manager instance wrapper method
-    groq_client = None
-    if key_manager:
-        try:
-            groq_client = key_manager.get_groq_client() 
-        except Exception as e:
-            logger.error(f"[{request_id}] Failed to acquire rotated Groq client from pool: {str(e)}", exc_info=True)
+    success = False
+    answer = ""
+    attempt = 0
+    backoff_delays = [1.0, 2.0, 4.0]
 
-    if not groq_client:
+    if not key_manager:
+        logger.critical(f"[{request_id}] Key manager runtime dependency object initialization is broken.")
         return {
             "request_id": request_id,
             "timestamp": timestamp_str,
             "detected_language": detected_language,
-            "answer": "System configuration error: No active keys found in the rotation client pools.",
+            "answer": "No active Groq API keys are currently available.\n\nPlease try again later.",
             "model": MODEL_NAME,
             "success": False,
-            "source": "Groq Key Error Routing Service Node",
+            "source": "Groq",
             "response_time": round(time.time() - start_time, 3)
         }
 
-    success = True
-    error_type = None
-    answer = ""
+    # Infinite Loop Driven By Dynamic Database Presence Checks
+    while key_manager.has_active_keys():
+        attempt += 1
+        attempt_start_time = time.time()
+        
+        # Load current Groq client from the dynamic database pool instance
+        groq_client = key_manager.get_groq_client()
+        current_key_id = key_manager.current_key_id or "unknown_key_id"
 
-    try:
-        response = groq_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": full_prompt}
-            ],
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            top_p=TOP_P,
-            stream=STREAM_MODE
-        )
-        answer = response.choices[0].message.content
+        if not groq_client:
+            logger.warning(f"[{request_id}] [Attempt {attempt}] Failed to extract operational client reference. Re-verifying pool...")
+            if not key_manager.has_active_keys():
+                break
+            continue
 
-    except groq.AuthenticationError as auth_err:
-        success = False
-        error_type = "AuthenticationError"
-        answer = "I am currently facing authentication issues logging into my backend network."
-        logger.error(f"[{request_id}] Groq Authentication Failure: {str(auth_err)}")
-        
-        if key_manager:
-            logger.warning(f"[{request_id}] Authentication failed. Dropping key from loop rotation...")
+        try:
+            logger.info(f"[{request_id}] [Attempt {attempt}] Forwarding completion transaction via Key ID: {current_key_id}")
+            response = groq_client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": full_prompt}
+                ],
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+                top_p=TOP_P,
+                stream=STREAM_MODE
+            )
+            answer = response.choices[0].message.content
+            success = True
+            
+            # Rebalance queue priorities by pushing this successful key back and shifting downstream nodes forward
+            key_manager.mark_current_key_used()
+            
+            latency = round(time.time() - attempt_start_time, 3)
+            logger.info(
+                f"[{request_id}] Attempt SUCCESS -> Attempt: {attempt} | Key ID: {current_key_id} | "
+                f"Model: {MODEL_NAME} | Latency: {latency}s | Success: True | Error: None"
+            )
+            break  # Break loop instantly upon processing transaction successfully
+
+        except (groq.AuthenticationError, groq.RateLimitError) as permanent_api_err:
+            error_type = type(permanent_api_err).__name__
+            latency = round(time.time() - attempt_start_time, 3)
+            
+            logger.warning(
+                f"[{request_id}] Attempt FAILED -> Attempt: {attempt} | Key ID: {current_key_id} | "
+                f"Model: {MODEL_NAME} | Latency: {latency}s | Success: False | Error: {error_type}"
+            )
+            
+            # Instantly burn and cycle out the exhausted configuration token record from database availability pipelines
             key_manager.handle_quota_exhausted()
-        
-    except groq.RateLimitError as rate_err:
-        success = False
-        error_type = "RateLimitError"
-        answer = "Our servers are experiencing heavy traffic. Please wait a minute and try asking again."
-        logger.warning(f"[{request_id}] Groq Rate Limit Encountered: {str(rate_err)}")
-        
-        if key_manager:
-            logger.warning(f"[{request_id}] Rate limit breached. Cycling out this API key...")
-            key_manager.handle_quota_exhausted()
-        
-    except Exception as e:
-        success = False
-        error_type = f"UnexpectedError: {type(e).__name__}"
-        answer = "An unexpected error occurred while compiling your financial response guidance."
-        logger.error(f"[{request_id}] Unexpected exception caught in synthesis layer: {str(e)}", exc_info=True)
+
+        except (TimeoutError, ConnectionError, OSError, groq.APIConnectionError) as transient_network_err:
+            error_type = type(transient_network_err).__name__
+            latency = round(time.time() - attempt_start_time, 3)
+            
+            logger.warning(
+                f"[{request_id}] Attempt FAILED (Transient) -> Attempt: {attempt} | Key ID: {current_key_id} | "
+                f"Model: {MODEL_NAME} | Latency: {latency}s | Success: False | Error: {error_type}"
+            )
+            
+            # Cycle to the next key block configuration structure mapping without marking it dead
+            key_manager.cycle_key()
+
+        except Exception as e:
+            error_type = f"UnexpectedError: {type(e).__name__}"
+            latency = round(time.time() - attempt_start_time, 3)
+            logger.exception(
+                f"[{request_id}] Unhandled runtime error trace hit in processing engine structure pipeline on attempt {attempt}:"
+            )
+            raise RuntimeError(f"Unchecked exception during synthesis processing block pipeline: {str(e)}") from e
+
+        # Apply exponential backing off logic rules if transactional sequence fails to settle context successfully
+        if not success and key_manager.has_active_keys():
+            # Pin max backup delay parameter safely at 4.0 seconds ceiling limit boundaries
+            current_delay = backoff_delays[min(attempt - 1, len(backoff_delays) - 1)]
+            logger.warning(f"[{request_id}] Attempt {attempt} failed. Retrying next connection profile node in {current_delay}s...")
+            time.sleep(current_delay)
+
+    # Exhaustive Pool Fallback Scenario Logging and Error Mask Assignment Mapping Flow
+    if not success:
+        answer = "No active Groq API keys are currently available.\n\nPlease try again later."
+        logger.error(f"[{request_id}] Core Lockout Error: Infinite Key Loop terminated because remote pool records are depleted completely.")
 
     elapsed_time = round(time.time() - start_time, 3)
-    logger.info(f"Req ID: {request_id} | Model: {MODEL_NAME} | Latency: {elapsed_time}s | Success: {success} | Error: {error_type}")
-
     return {
         "request_id": request_id,
         "timestamp": timestamp_str,
