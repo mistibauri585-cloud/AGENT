@@ -1,8 +1,9 @@
+import os
 import time
 import uuid
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, UploadFile, File, HTTPException, status
+from fastapi import APIRouter, UploadFile, File, HTTPException, status, Header
 
 from app.models.schemas import ChatRequest, ChatResponse
 from app.services.llm_service import ask_the_principal
@@ -15,6 +16,9 @@ from app.database import chromadb_client
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1")
+
+# Fetch environment variables for admin route protection
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
 
 async def process_core_chat_pipeline(question: str, request_id: str, start_time: float) -> ChatResponse:
@@ -53,8 +57,6 @@ async def process_core_chat_pipeline(question: str, request_id: str, start_time:
             logger.warning(f"[{request_id}] Redis read bypass on exception: {str(e)}")
 
     # 3. Unified Hybrid Knowledge Base Core Query
-    # Requirement 2 Fix: Rely entirely on search_bookshelf to perform ChromaDB search + Tavily fallback.
-    # This prevents duplicate API calls, eliminates API latency bleed, and stops Tavily resource exhaustion.
     context = ""
     source_identity = "Unknown"
     logger.info(f"[{request_id}] Cache Miss | Initiating unified vector and fallback search workspace.")
@@ -119,6 +121,12 @@ async def text_chat_endpoint(payload: ChatRequest):
             detail="Question payload cannot be empty or blank structures."
         )
         
+    if len(question) > 5000:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Question length exceeds maximum supported structure size (5000 chars)."
+        )
+        
     return await process_core_chat_pipeline(question, request_id, start_time)
 
 
@@ -134,6 +142,17 @@ async def voice_chat_endpoint(audio_file: UploadFile = File(...)):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Valid multipart form binary audio payload required."
+        )
+
+    # Validate audio media types before consuming server runtime processing cycles
+    allowed_types = {
+        "audio/mpeg", "audio/mp3", "audio/wav", 
+        "audio/x-wav", "audio/webm", "audio/mp4", "audio/ogg"
+    }
+    if audio_file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported audio format '{audio_file.content_type}'."
         )
 
     # 1. Audio Transcription Processing with Explicit Signature Dictionary Handlers
@@ -181,8 +200,14 @@ def health_check():
 
 
 @router.post("/reindex", status_code=status.HTTP_200_OK)
-def trigger_reindexing():
+def trigger_reindexing(x_admin_token: str = Header(...)):
     """Administrative maintenance endpoint mapping file additions inside the document workspace directory."""
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Invalid or missing administration credentials."
+        )
+
     start_time = time.time()
     try:
         indexing_summary = ingest_all_pdfs_from_folder("pdfs")
