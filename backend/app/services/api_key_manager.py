@@ -2,7 +2,7 @@
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional
 import groq
 # Assume your project's Supabase client generator import matches your internal pathing
 from app.database.supabase_client import get_supabase_client 
@@ -14,11 +14,17 @@ class SupabaseKeyManager:
     Enables automatic rotation, state management, and thread-safe pool management.
     """
     def __init__(self):
-        self.supabase = get_supabase_client()
         self._lock = threading.RLock()
         self._current_client: Optional[groq.Groq] = None
         self._active_key_id: Optional[str] = None
         self._current_raw_key: Optional[str] = None
+        
+        # Safely initialize Supabase client to prevent startup import crashes
+        try:
+            self.supabase = get_supabase_client()
+        except Exception:
+            logger.exception("Failed to initialize Supabase client. Manager entering degraded state.")
+            self.supabase = None
         
         # Load initial key candidate context under thread-safe visibility bounds
         with self._lock:
@@ -32,6 +38,10 @@ class SupabaseKeyManager:
 
     def get_active_key_count(self) -> int:
         """Returns the absolute current count of active keys within the database."""
+        if self.supabase is None:
+            logger.warning("Supabase client is uninitialized. Cannot count active keys.")
+            return 0
+            
         try:
             response = self.supabase.table("groq_api_keys")\
                 .select("id", count="exact")\
@@ -61,12 +71,17 @@ class SupabaseKeyManager:
         """Queries the database for the oldest or next available active key profile row.
         Internal helper: Assumes the caller already securely holds self._lock.
         """
+        if self.supabase is None:
+            logger.warning("Supabase client is uninitialized. Aborting key loading pipeline.")
+            self._clear_current_state()
+            return
+
         try:
             # Predictably pulls the least recently used active key via ascending updated_at sequence
             response = self.supabase.table("groq_api_keys")\
-                .select("id", "api_key")\
+                .select("id, api_key")\
                 .eq("status", "active")\
-                .order("updated_at", ascending=True)\
+                .order("updated_at", desc=False)\
                 .limit(1)\
                 .execute()
             
@@ -88,6 +103,11 @@ class SupabaseKeyManager:
         clears local state cache, and loads the next active key for true round-robin fallback.
         """
         with self._lock:
+            if self.supabase is None:
+                logger.warning("Supabase client is uninitialized. Cannot cycle key in remote database.")
+                self._clear_current_state()
+                return
+
             if self._active_key_id:
                 target_key_id = self._active_key_id
                 now_iso = datetime.now(timezone.utc).isoformat()
@@ -108,6 +128,11 @@ class SupabaseKeyManager:
         then immediately rotates the in-memory client state to point to the next fresh candidate.
         """
         with self._lock:
+            if self.supabase is None:
+                logger.warning("Supabase client is uninitialized. Skipping usage timestamp sync.")
+                self._clear_current_state()
+                return
+
             if self._active_key_id:
                 target_key_id = self._active_key_id
                 now_iso = datetime.now(timezone.utc).isoformat()
@@ -128,6 +153,11 @@ class SupabaseKeyManager:
         ISO string timestamps and forces an immediate rotation swap.
         """
         with self._lock:
+            if self.supabase is None:
+                logger.warning("Supabase client is uninitialized. Cannot mark key status as exhausted.")
+                self._clear_current_state()
+                return
+
             if not self._active_key_id:
                 self._load_next_valid_key()
                 return
@@ -155,6 +185,7 @@ class SupabaseKeyManager:
     def get_groq_client(self) -> Optional[groq.Groq]:
         """Returns the current valid operational client workspace wrapper instance."""
         with self._lock:
-            if not self._current_client and self.has_active_keys():
+            # Optimized: Streamlined to avoid nested lock queries and redundant database counts
+            if self._current_client is None:
                 self._load_next_valid_key()
             return self._current_client
