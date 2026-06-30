@@ -1,3 +1,5 @@
+# backend/app/main.py
+import time
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -17,9 +19,10 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 8. Start exact visual log sequence
+    # 8. Start exact visual log sequence and initialize startup benchmark timer
     logger.info("---------------------------------------------------")
     logger.info("Starting Appna Finance AI Backend...")
+    startup_start = time.time()
     
     # --- STEP 1: INITIALIZE REDIS ---
     logger.info("Initializing Redis...")
@@ -61,12 +64,29 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error validating knowledge base metrics status: {str(e)}", exc_info=True)
 
-    logger.info("Startup Complete")
+    startup_time = round(time.time() - startup_start, 2)
+    logger.info(f"Startup Complete - Backend started successfully in {startup_time} seconds.")
     logger.info("---------------------------------------------------")
     
     yield  # Hand over operational runtime flow control to the ASGI application layer
     
-    # Optional: Run cleanup logic here if needed when the container stops
+    # =====================================================================
+    # GRACEFUL SHUTDOWN SEQUENCING
+    # =====================================================================
+    logger.info("Stopping Appna Finance AI Backend...")
+    
+    try:
+        if hasattr(redis_cache, 'disconnect'):
+            redis_cache.disconnect()
+            logger.info("Redis connection pool disconnected cleanly.")
+        elif hasattr(redis_cache, 'redis_client') and hasattr(redis_cache.redis_client, 'close'):
+            redis_cache.redis_client.close()
+            logger.info("Redis network client closed cleanly.")
+    except Exception as shutdown_err:
+        logger.warning(f"Redis cleanup boundary encountered warning: {str(shutdown_err)}")
+        
+    logger.info("Shutdown complete. Container terminating safely.")
+
 
 # 1. Initialize core FastAPI framework using the standard lifespan routing agent
 app = FastAPI(
@@ -88,7 +108,7 @@ app.add_middleware(
 app.include_router(router)
 
 # =====================================================================
-# 12. ROOT SYSTEM APP CHECK ENDPOINT
+# 12. SYSTEM APPLICATION STATUS & DIAGNOSTICS ENDPOINTS
 # =====================================================================
 @app.get("/")
 def root():
@@ -97,4 +117,58 @@ def root():
         "message": "Appna Finance AI Backend is running.",
         "version": "1.0",
         "status": "healthy"
+    }
+
+
+@app.get("/health")
+def health():
+    """Dedicated health check endpoint providing structural diagnostic payloads 
+    for monitoring dashboards, verifying connectivity status across database layers.
+    """
+    redis_healthy = False
+    redis_diagnostics = "disconnected"
+    
+    # 1. Safely evaluate Redis connectivity status
+    try:
+        if hasattr(redis_cache, 'check_connection'):
+            redis_diagnostics = redis_cache.check_connection()
+            # Handle both boolean or dictionary response representations smoothly
+            if isinstance(redis_diagnostics, dict):
+                redis_healthy = redis_diagnostics.get("status") == "healthy"
+            else:
+                redis_healthy = bool(redis_diagnostics)
+        elif hasattr(redis_cache, 'redis_client'):
+            redis_healthy = bool(redis_cache.redis_client.ping())
+            redis_diagnostics = "connected" if redis_healthy else "disconnected"
+    except Exception as redis_err:
+        redis_diagnostics = {"status": "unhealthy", "error": str(redis_err)}
+        redis_healthy = False
+
+    # 2. Safely evaluate ChromaDB connectivity and extract nested schema state
+    chroma_status = {"status": "unhealthy", "error": "Unknown status check configuration"}
+    chroma_healthy = False
+    
+    try:
+        if hasattr(chromadb_client, 'check_database'):
+            chroma_status = chromadb_client.check_database()
+            # FIXED: Explicitly string-match the status instead of evaluating the truthiness of the dict
+            chroma_healthy = chroma_status.get("status") == "healthy"
+        else:
+            # Safe structural fallback sequence if interface contract shifts
+            collection_exists = chromadb_client.get_collection("appna_bank_knowledge") is not None
+            chroma_status = {"status": "healthy" if collection_exists else "unhealthy"}
+            chroma_healthy = collection_exists
+    except Exception as chroma_err:
+        chroma_status = {"status": "error", "error": str(chroma_err)}
+        chroma_healthy = False
+
+    # 3. Compute overall system state based on strict component health criteria
+    system_status = "healthy" if (redis_healthy and chroma_healthy) else "degraded"
+
+    return {
+        "status": system_status,
+        "redis": redis_diagnostics,
+        "chromadb": chroma_status,
+        "version": "1.0",
+        "timestamp": time.time()
     }
