@@ -103,6 +103,7 @@ def transcribe_audio(file_object: BinaryIO, filename: str, mime_type: Optional[s
     normalized_lang = "Unknown"
     error_message = None
     success = False
+    attempt = 0
 
     # Infinite retry loop matching llm_service pattern until success or out of keys
     while key_manager.has_active_keys():
@@ -111,9 +112,10 @@ def transcribe_audio(file_object: BinaryIO, filename: str, mime_type: Optional[s
             error_message = "No operational Groq clients could be fetched from rotation manager."
             break
 
-        # Cleaner, more Pythonic direct access to the key manager property
+        # Dynamic structural tracking metrics tracking sequential failures
+        attempt += 1
         current_key = key_manager.current_key_id or "Unknown ID"
-        logger.info(f"[Req: {request_id}] Whisper transcription using Key ID: {current_key}")
+        logger.info(f"[Req: {request_id}] Attempt {attempt} | Key ID: {current_key}")
 
         try:
             # Ensure the pointer is correctly at the absolute beginning of stream buffer for retries
@@ -131,7 +133,8 @@ def transcribe_audio(file_object: BinaryIO, filename: str, mime_type: Optional[s
                 transcription_text = response.get("text", "")
                 
             if not transcription_text or not transcription_text.strip():
-                logger.warning(f"[Req: {request_id}] Whisper returned an empty payload string. No vocal tokens generated.")
+                # Logging check for blank/empty audio structures to optimize observability
+                logger.warning(f"[Req: {request_id}] Audio contained no recognizable speech.")
                 return {
                     "request_id": request_id,
                     "success": False,
@@ -155,7 +158,6 @@ def transcribe_audio(file_object: BinaryIO, filename: str, mime_type: Optional[s
             key_manager.mark_current_key_used()
             success = True
             
-            # Successful transcription logging statement
             logger.info(f"[Req: {request_id}] Whisper transcription completed successfully.")
             break  
             
@@ -188,7 +190,6 @@ def transcribe_audio(file_object: BinaryIO, filename: str, mime_type: Optional[s
                 break
 
         except Exception as e:
-            # Capture unexpected structural crashes along with their comprehensive trace boundaries
             logger.exception(f"[Req: {request_id}] Unexpected Whisper runtime failure.")
             error_message = f"UnexpectedError: Whisper pipeline process crash: {type(e).__name__} - {str(e)}"
             break
