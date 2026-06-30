@@ -111,8 +111,8 @@ def transcribe_audio(file_object: BinaryIO, filename: str, mime_type: Optional[s
             error_message = "No operational Groq clients could be fetched from rotation manager."
             break
 
-        # Log trace identifier matching your dynamic key tracking metrics
-        current_key = getattr(key_manager, "current_key_id", "Unknown ID")
+        # Cleaner, more Pythonic direct access to the key manager property
+        current_key = key_manager.current_key_id or "Unknown ID"
         logger.info(f"[Req: {request_id}] Whisper transcription using Key ID: {current_key}")
 
         try:
@@ -154,6 +154,9 @@ def transcribe_audio(file_object: BinaryIO, filename: str, mime_type: Optional[s
             
             key_manager.mark_current_key_used()
             success = True
+            
+            # Successful transcription logging statement
+            logger.info(f"[Req: {request_id}] Whisper transcription completed successfully.")
             break  
             
         except (groq.AuthenticationError, groq.RateLimitError) as e:
