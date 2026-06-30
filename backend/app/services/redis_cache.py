@@ -1,3 +1,4 @@
+# backend/app/services/redis_cache.py
 import os
 import time
 import json
@@ -8,8 +9,8 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import redis
 
-# Configure production logging format
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - [Redis] - %(message)s")
+# Configure clean, isolated module-scoped logger (No basicConfig overrides)
+logger = logging.getLogger(__name__)
 
 # =====================================================================
 # CONFIGURATION & CONSTANTS
@@ -43,7 +44,7 @@ def connect() -> None:
             return
             
         try:
-            logging.info("Initializing Singleton Redis Connection Pool...")
+            logger.info("Initializing Singleton Redis Connection Pool...")
             pool = redis.ConnectionPool.from_url(
                 url=REDIS_URL,
                 socket_timeout=REDIS_SOCKET_TIMEOUT,
@@ -53,22 +54,56 @@ def connect() -> None:
             client = redis.Redis(connection_pool=pool)
             
             # Proactively verify active connection signature
-            logging.info("Verifying connectivity via target server ping handshake...")
+            logger.info("Verifying connectivity via target server ping handshake...")
             client.ping()
             
             # Commit state handles only after a successful handshake verification pass
             _redis_pool = pool
             _redis_client = client
-            logging.info("Redis Core Client initialized and verified successfully.")
+            logger.info("Redis Core Client initialized and verified successfully.")
             
         except (redis.RedisError, redis.ConnectionError) as conn_err:
-            logging.error(f"Verification ping failed during connect(). Leaving client uninitialized: {str(conn_err)}")
+            logger.error(f"Verification ping failed during connect(). Leaving client uninitialized: {str(conn_err)}")
             _redis_pool = None
             _redis_client = None
         except Exception as e:
-            logging.error(f"Unexpected exception building Redis connection matrix payload structures: {str(e)}")
+            logger.error(f"Unexpected exception building Redis connection matrix payload structures: {str(e)}")
             _redis_pool = None
             _redis_client = None
+
+
+def disconnect() -> None:
+    """Gracefully closes the active Redis client connections and pool resources 
+
+    to ensure clean context disposal during application container shutdowns.
+    """
+    global _redis_client, _redis_pool
+
+    with _init_lock:
+        try:
+            if _redis_client:
+                _redis_client.close()
+                logger.info("Redis network client execution layer closed.")
+
+            if _redis_pool:
+                _redis_pool.disconnect()
+                logger.info("Redis connection pool resources detached completely.")
+
+            logger.info("Redis connection pool shutdown complete.")
+        except Exception as e:
+            logger.warning(f"Redis shutdown boundary encountered cleanup warnings: {str(e)}")
+        finally:
+            _redis_client = None
+            _redis_pool = None
+
+
+def reconnect() -> None:
+    """Forces an explicit tear-down and rebuild of the singleton connection state 
+    to assist with automatic self-healing routines if network gaps occur.
+    """
+    logger.info("Triggering explicit network pipeline recovery sequence...")
+    disconnect()
+    connect()
 
 
 def _get_client() -> Optional[redis.Redis]:
@@ -91,7 +126,7 @@ def generate_cache_key(question: str) -> Optional[str]:
         hash_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         return f"appna_bank:cache:{hash_digest}"
     except Exception as e:
-        logging.error(f"Error executing key fingerprint compression: {str(e)}")
+        logger.error(f"Error executing key fingerprint compression: {str(e)}")
         return None
 
 
@@ -110,13 +145,13 @@ def get(key: str) -> Optional[Dict[str, Any]]:
     try:
         cached_data = client.get(key)
         if cached_data:
-            logging.info("Cache hit occurred on current signature layout footprint tracking.")
+            logger.info("Cache hit occurred on current signature layout footprint tracking.")
             return json.loads(cached_data)
             
-        logging.info("Cache miss recorded against target tracking matrix block.")
+        logger.info("Cache miss recorded against target tracking matrix block.")
         return None
     except Exception as e:
-        logging.error(f"Graceful Error Handling: Intercepted GET query mapping exception: {str(e)}")
+        logger.error(f"Graceful Error Handling: Intercepted GET query mapping exception: {str(e)}")
         return None
 
 
@@ -128,14 +163,13 @@ def set(key: str, value: Dict[str, Any], ttl: int = DEFAULT_TTL_SECONDS) -> bool
     if not key or not value:
         return False
 
-    # 1. FIXED: Corrected multi-assignment assignment typo directly here
     client = _get_client()
     if client is None:
         return False
 
     # Base dictionary integrity verification checks
     if not isinstance(value, dict) or "answer" not in value or not str(value.get("answer")).strip():
-        logging.warning("Cache set rejected: Supplied data payload structural mismatch errors caught.")
+        logger.warning("Cache set rejected: Supplied data payload structural mismatch errors caught.")
         return False
 
     try:
@@ -151,13 +185,47 @@ def set(key: str, value: Dict[str, Any], ttl: int = DEFAULT_TTL_SECONDS) -> bool
         
         serialized_string = json.dumps(payload)
         
-        # 2. IMPROVEMENT: Use setex explicitly to enforce set-with-expiration behavior
+        # Use setex explicitly to enforce set-with-expiration behavior
         client.setex(key, ttl, serialized_string)
-        logging.info(f"Cache entry successfully committed. Allocated expiration window TTL: {ttl}s")
+        logger.info(f"Cache entry successfully committed. Allocated expiration window TTL: {ttl}s")
         return True
     except Exception as e:
-        logging.error(f"Graceful Error Handling: Intercepted SET query transaction exception: {str(e)}")
+        logger.error(f"Graceful Error Handling: Intercepted SET query transaction exception: {str(e)}")
         return False
+
+
+def exists(key: str) -> bool:
+    """Asserts existence signatures directly within the cluster map to prevent redundant lookups."""
+    if not key:
+        return False
+
+    client = _get_client()
+    if client is None:
+        return False
+
+    try:
+        return bool(client.exists(key))
+    except Exception as e:
+        logger.error(f"Failed querying cache address key signature assertion state: {str(e)}")
+        return False
+
+
+def ttl(key: str) -> int:
+    """Retrieves remaining time-to-live seconds for a specific key.
+    Returns -1 if the key exists but has no associated expire, and -2 if the key does not exist.
+    """
+    if not key:
+        return -2
+
+    client = _get_client()
+    if client is None:
+        return -2
+
+    try:
+        return int(client.ttl(key))
+    except Exception as e:
+        logger.error(f"Failed pulling remaining lifespan analytics for tracking signature block: {str(e)}")
+        return -2
 
 
 def delete(key: str) -> bool:
@@ -171,10 +239,10 @@ def delete(key: str) -> bool:
 
     try:
         result = client.delete(key)
-        logging.info(f"Cache key entry invalidation run executed. Clean parameters cleared count: {result}")
+        logger.info(f"Cache key entry invalidation run executed. Clean parameters cleared count: {result}")
         return result > 0
     except Exception as e:
-        logging.error(f"Error executing explicit signature key erasure commands: {str(e)}")
+        logger.error(f"Error executing explicit signature key erasure commands: {str(e)}")
         return False
 
 
@@ -197,10 +265,10 @@ def clear() -> bool:
             if cursor == 0:
                 break
                 
-        logging.info(f"Cache cleanup operations completed execution. Evicted namespace index maps count: {total_evicted}")
+        logger.info(f"Cache cleanup operations completed execution. Evicted namespace index maps count: {total_evicted}")
         return True
     except Exception as e:
-        logging.error(f"Fatal exception occurred executing namespace cache purge routines: {str(e)}")
+        logger.error(f"Fatal exception occurred executing namespace cache purge routines: {str(e)}")
         return False
 
 
@@ -234,6 +302,3 @@ def health_check() -> Dict[str, Any]:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "message": diagnostic_message
     }
-
-# 3. Lifespan Ready: Implicit execution on load is completely disabled.
-# Remember to run `redis_cache.connect()` explicitly in your FastAPI startup event wrapper!
