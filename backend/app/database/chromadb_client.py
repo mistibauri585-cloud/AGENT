@@ -3,25 +3,22 @@ import os
 import time
 import logging
 import threading
-import json
-import socket
-import urllib.request
-import urllib.error
 from typing import Dict, Any, Optional, List
 import chromadb
 from chromadb.api import ClientAPI
 from chromadb.api.models.Collection import Collection
 from chromadb.api.types import Documents, Embeddings, EmbeddingFunction
+from huggingface_hub import InferenceClient
 
 # =====================================================================
 # Centralized Production Constants
 # =====================================================================
 CHROMA_DB_PATH: str = os.getenv("CHROMA_DB_PATH", "chroma_db_storage")
 
-# Dynamically load model identifier from environment context with safety fallback
+# Read the embedding model from environment variables with the requested default
 EMBEDDING_MODEL_NAME: str = os.getenv(
     "EMBEDDING_MODEL_NAME",
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    "BAAI/bge-m3"
 )
 
 COLLECTION_METADATA_BLUEPRINT: Dict[str, Any] = {
@@ -35,117 +32,62 @@ COLLECTION_METADATA_BLUEPRINT: Dict[str, Any] = {
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# Custom Zero-RAM Serverless Embedding Function with Auto-Retry & Timeout
+# Official SDK HuggingFace Embedding Function with Thread Safety
 # =====================================================================
 class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
-    """Custom embedding function that routes text formatting tasks remotely
-    to the current Hugging Face Inference API. Consumes 0MB local server memory.
+    """Custom embedding function that routes text embedding tasks remotely
+    via the official huggingface_hub InferenceClient. Consumes 0MB local server memory.
     """
-    def __init__(self, api_key: str, model_name: str):
+    def __init__(self, api_key: Optional[str], model_name: str):
         if not api_key:
+            logger.critical("Initialization failed: 'HUGGINGFACE_API_KEY' environment variable is missing.")
             raise RuntimeError(
                 "Critical Configuration Error: 'HUGGINGFACE_API_KEY' environment variable is missing. "
                 "Remote embedding computations cannot proceed without a valid token."
             )
-        self.api_key = api_key
+        
         self.model_name = model_name.strip()
         
-        # Route traffic through the current stable Hugging Face inference router
-        self.api_url = f"https://router.huggingface.co/hf-inference/models/{self.model_name}"
+        # Instantiate the official SDK client using the serverless hf-inference provider layout
+        self.client = InferenceClient(
+            provider="hf-inference",
+            api_key=api_key
+        )
+        logger.info(f"Hugging Face InferenceClient initialized successfully using model: {self.model_name}")
 
     def __call__(self, input: Documents) -> Embeddings:
         # Normalize incoming inputs into standard list strings
         texts = [input] if isinstance(input, str) else list(input)
         batch_size = len(texts)
         
-        # Fixed: Removed the "options" configuration block entirely to stabilize payload structure
-        payload = json.dumps({"inputs": texts}).encode("utf-8")
+        logger.info(f"Embedding request start: Dispatching {batch_size} text inputs to huggingface_hub InferenceClient.")
         
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "AppnaBankAI/1.0"
-        }
-
-        # Parameters meeting requirement criteria precisely
-        max_retries = 3
-        backoff_delays = [1.0, 2.0, 4.0]  # Exponential backoff array sequence
-        
-        # Fixed: Extended timeout to 120 seconds to completely guard against upstream cold-starts
-        timeout_seconds = 120.0
-
-        logger.info(f"embedding request start: Dispatching remote vectors to Hugging Face API for batch size: {batch_size}")
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                req = urllib.request.Request(self.api_url, data=payload, headers=headers, method="POST")
-                
-                with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-                    status_code = response.getcode()
-                    logger.info(f"Hugging Face Remote API Status Code: {status_code} on attempt {attempt}")
-                    
-                    result = json.loads(response.read().decode("utf-8"))
-                    
-                    # Intercept dictionary error blocks early to expose descriptive upstream exceptions
-                    if isinstance(result, dict):
-                        logger.error(f"Hugging Face Dictionary Response Exception payload: {result}")
-                        raise RuntimeError(result.get("error", "Unknown Hugging Face internal engine error encountered."))
-                    
-                    if not isinstance(result, list):
-                        raise ValueError("Received an invalid response structure payload from Hugging Face endpoint.")
-                    
-                    logger.info(f"Embedding request successfully generated for batch size: {batch_size}")
-                    return result
-
-            except urllib.error.HTTPError as http_err:
-                status_code = http_err.code
-                error_body = ""
-                try:
-                    error_body = http_err.read().decode("utf-8")
-                except Exception:
-                    pass
-                
-                # Logs both the HTTP status code and response body when Hugging Face returns an error
-                logger.error(f"HTTP Error {status_code} on attempt {attempt}: {http_err.reason} | Response Body: {error_body}")
-                
-                # Explicit handling for rate limits to optimize observability
-                if status_code == 429:
-                    logger.warning("Hugging Face rate limit reached.")
-
-                # Immediately raise permanent errors. Do not retry client bugs or invalid schemas.
-                if status_code in [400, 401, 403, 404, 422]:
-                    logger.error(f"Permanent API Exception (HTTP {status_code}): {http_err.reason} - Failing immediately without retry.")
-                    raise RuntimeError(f"Permanent API Exception (HTTP {status_code}): {http_err.reason} - {error_body}")
-                
-                # Transient errors updates retry paths
-                if attempt == max_retries:
-                    logger.exception(f"Embedding generation failed after {max_retries} attempts.")
-                    raise RuntimeError(f"Failed to generate embeddings after {max_retries} attempts. HTTP Error: {status_code}")
-                
-            except (urllib.error.URLError, TimeoutError, socket.gaierror) as network_err:
-                logger.exception(f"Transient network error/timeout/DNS anomaly on attempt {attempt}: {str(network_err)}")
-                if attempt == max_retries:
-                    logger.exception(f"Embedding generation failed after {max_retries} attempts.")
-                    raise RuntimeError(f"Failed to generate embeddings due to network failure or timeout after {max_retries} attempts.")
-                    
-            except Exception as e:
-                # Catch-all unexpected anomalies (e.g., parsing failures) - immediate fail to keep ingestion pipeline safe
-                logger.exception(f"Non-transient or parsing error exception on attempt {attempt}: {str(e)}")
-                raise RuntimeError(f"Unexpected processing exception inside embedding wrapper: {str(e)}")
-
-            # Wait using explicit exponential backoff scale (1s, 2s, 4s) with enhanced logging
-            current_delay = backoff_delays[attempt - 1]
-            logger.warning(
-                f"Embedding request failed.\n\n"
-                f"Attempt:\n"
-                f"{attempt} / {max_retries}\n\n"
-                f"Retrying in\n"
-                f"{int(current_delay)} seconds..."
+        try:
+            # Fixed: Explicitly mapping to the text keyword argument for modern SDK syntax alignment
+            response = self.client.feature_extraction(
+                text=texts,
+                model=self.model_name
             )
-            time.sleep(current_delay)
+            
+            # Fail gracefully and defensively if feature_extraction returns an invalid structure or None
+            if response is None:
+                raise ValueError("InferenceClient returned an empty response payload (None).")
+            
+            # Handle NumPy arrays or different return sequences gracefully if converted by SDK wrapper layers
+            if hasattr(response, "tolist"):
+                embeddings = response.tolist()
+            else:
+                embeddings = response
 
-        logger.exception(f"Embedding generation failed after {max_retries} attempts.")
-        raise RuntimeError("Final failure: Embedding function evaluation route exited retry loop unexpectedly.")
+            if not isinstance(embeddings, list):
+                raise ValueError(f"Invalid response structure type: Expected list but got {type(embeddings).__name__}")
+            
+            logger.info(f"Embedding vectors successfully compiled via huggingface_hub for batch size: {batch_size}")
+            return embeddings
+
+        except Exception as e:
+            logger.error(f"Failed to extract features via huggingface_hub SDK: {str(e)}", exc_info=True)
+            raise RuntimeError(f"Hugging Face Inference SDK Exception tracking point: {str(e)}")
 
 # =====================================================================
 # System Lifecycle Singletons & Cache Matrices
@@ -184,33 +126,17 @@ def initialize_database() -> None:
             hf_token = os.getenv("HUGGINGFACE_API_KEY", "")
             _embedding_function = ZeroRamHuggingFaceEmbedding(api_key=hf_token, model_name=EMBEDDING_MODEL_NAME)
             
-            # Postpone validation checklist processing until first transactional access point
-            logger.info("Remote embedding engine validation deferred. Health verification checks will occur lazily on first embedding runtime invocation context.")
-
             _initialized = True
             total_startup_time = round(time.time() - start_init_time, 4)
             
             logger.info(
                 f"""
 ===================================
-
 Appna Bank AI ChromaDB Ready
-
-Database:
-{CHROMA_DB_PATH}
-
-Embedding Model:
-{EMBEDDING_MODEL_NAME}
-
-Endpoint:
-{_embedding_function.api_url}
-
-Startup Time:
-{total_startup_time} seconds
-
-Status:
-READY
-
+Database Path:    {CHROMA_DB_PATH}
+Embedding Model:  {EMBEDDING_MODEL_NAME}
+Startup Time:     {total_startup_time} seconds
+Status:           READY
 ===================================
 """
             )
