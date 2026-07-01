@@ -17,7 +17,12 @@ from chromadb.api.types import Documents, Embeddings, EmbeddingFunction
 # Centralized Production Constants
 # =====================================================================
 CHROMA_DB_PATH: str = os.getenv("CHROMA_DB_PATH", "chroma_db_storage")
-EMBEDDING_MODEL_NAME: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+# Dynamically load model identifier from environment context with safety fallback
+EMBEDDING_MODEL_NAME: str = os.getenv(
+    "EMBEDDING_MODEL_NAME",
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
 
 COLLECTION_METADATA_BLUEPRINT: Dict[str, Any] = {
     "hnsw:space": "cosine",  # Enforcing strict cosine similarity
@@ -43,15 +48,19 @@ class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
                 "Remote embedding computations cannot proceed without a valid token."
             )
         self.api_key = api_key
-        # Updated to use the modern, officially supported Feature Extraction pipeline path
-        self.api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_name}"
+        self.model_name = model_name.strip()
+        
+        # Route traffic through the current stable Hugging Face inference router
+        self.api_url = f"https://router.huggingface.co/hf-inference/models/{self.model_name}"
 
     def __call__(self, input: Documents) -> Embeddings:
         # Normalize incoming inputs into standard list strings
         texts = [input] if isinstance(input, str) else list(input)
         batch_size = len(texts)
         
-        payload = json.dumps({"inputs": texts, "options": {"wait_for_model": True}}).encode("utf-8")
+        # Fixed: Removed the "options" configuration block entirely to stabilize payload structure
+        payload = json.dumps({"inputs": texts}).encode("utf-8")
+        
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -61,7 +70,9 @@ class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
         # Parameters meeting requirement criteria precisely
         max_retries = 3
         backoff_delays = [1.0, 2.0, 4.0]  # Exponential backoff array sequence
-        timeout_seconds = 30.0            # Calibrated exactly to 30s timeout parameters
+        
+        # Fixed: Extended timeout to 120 seconds to completely guard against upstream cold-starts
+        timeout_seconds = 120.0
 
         logger.info(f"embedding request start: Dispatching remote vectors to Hugging Face API for batch size: {batch_size}")
 
@@ -75,11 +86,10 @@ class ZeroRamHuggingFaceEmbedding(EmbeddingFunction):
                     
                     result = json.loads(response.read().decode("utf-8"))
                     
-                    # Check for explicit API error response mapping structures
-                    if isinstance(result, dict) and "error" in result:
-                        error_msg = result['error']
-                        logger.error(f"API error message on attempt {attempt}: {error_msg}")
-                        raise RuntimeError(f"Hugging Face Remote API Exception: {error_msg}")
+                    # Intercept dictionary error blocks early to expose descriptive upstream exceptions
+                    if isinstance(result, dict):
+                        logger.error(f"Hugging Face Dictionary Response Exception payload: {result}")
+                        raise RuntimeError(result.get("error", "Unknown Hugging Face internal engine error encountered."))
                     
                     if not isinstance(result, list):
                         raise ValueError("Received an invalid response structure payload from Hugging Face endpoint.")
