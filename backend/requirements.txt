@@ -8,25 +8,21 @@ python-multipart>=0.0.18
 redis>=5.0.0
 supabase>=2.10.0
 
-# Vector Database Infrastructures (Full Storage Engine Driver)
+# Vector Database
 chromadb>=0.6.3
 
-# System Localization Matrices
+# Hugging Face SDK
+huggingface_hub>=0.33.0
+
+# Localization
 langdetect>=1.0.9
 python-dotenv>=1.0.1
 
-# Text, PDF Parser & Web Core Assets
+# PDF / HTTP
 pypdf>=5.0.0
 requests>=2.32.0
 typing-extensions>=4.12.0
 
-# Machine Learning & AI Inference APIs
+# AI APIs
 groq>=1.5.0
 tavily-python>=0.5.0
-
-# =====================================================================
-# CRITICAL NOTE: To maintain lightweight Railway Free Tier containers 
-# and eliminate Out-of-Memory (OOM) crashes, torch, transformers, and 
-# sentence-transformers have been offloaded to cloud API pipelines 
-# (HuggingFace Inference API). Local heavy wheels are removed.
-# =====================================================================
