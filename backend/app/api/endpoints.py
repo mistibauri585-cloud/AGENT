@@ -44,14 +44,13 @@ async def process_core_chat_pipeline(question: str, request_id: str, start_time:
             if cached_response:
                 elapsed_time = round((time.time() - start_time), 3)
                 logger.info(f"[{request_id}] Cache Hit | Source: Redis Cache | Time: {elapsed_time}s")
+                
                 return ChatResponse(
-                    success=True,
-                    question=normalized_question,
-                    answer=cached_response["answer"],
+                    user_speech_text=normalized_question,
                     detected_language=cached_response.get("detected_language", "Unknown"),
-                    source="Redis Cache",
-                    response_time=elapsed_time,
-                    timestamp=datetime.now(timezone.utc).isoformat()
+                    answer=cached_response["answer"],
+                    source_type="cache",
+                    source_name="Redis Cache"
                 )
         except Exception as e:
             logger.warning(f"[{request_id}] Redis read bypass on exception: {str(e)}")
@@ -77,6 +76,10 @@ async def process_core_chat_pipeline(question: str, request_id: str, start_time:
     # 4. Core Language Model Text Synthesis
     try:
         ai_output = ask_the_principal(normalized_question, context)
+
+        if not ai_output:
+            raise ValueError("LLM returned an empty response.")
+
         detected_lang = ai_output.get("detected_language", "Unknown")
         final_answer = ai_output.get("answer", "")
     except Exception as e:
@@ -98,13 +101,11 @@ async def process_core_chat_pipeline(question: str, request_id: str, start_time:
             logger.warning(f"[{request_id}] Redis transaction write failure: {str(e)}")
 
     return ChatResponse(
-        success=True,
-        question=normalized_question,
-        answer=final_answer,
+        user_speech_text=normalized_question,
         detected_language=detected_lang,
-        source=source_identity,
-        response_time=elapsed_time,
-        timestamp=datetime.now(timezone.utc).isoformat()
+        answer=final_answer,
+        source_type="knowledge_base",
+        source_name=source_identity
     )
 
 
@@ -176,9 +177,6 @@ async def voice_chat_endpoint(audio_file: UploadFile = File(...)):
 
     # 2. Re-Route into Shared Execution Stream to maintain dry constraints
     response = await process_core_chat_pipeline(question, request_id, start_time)
-    
-    # Recalculate response latency metrics to fully measure speech integration performance
-    response.response_time = round((time.time() - start_time), 3)
     return response
 
 
