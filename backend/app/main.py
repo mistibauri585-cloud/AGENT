@@ -54,25 +54,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"ChromaDB database layer setup failed: {str(e)}", exc_info=True)
 
-    # --- STEP 3: INITIALIZE SUPABASE (SINGLE SOURCE OF TRUTH) ---
+    # --- STEP 3: INITIALIZE SUPABASE ---
     logger.info("Initializing Supabase Core Connection...")
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     
     if not supabase_url or not supabase_key or create_client is None:
         logger.error("Supabase environment configuration tokens or client libraries are missing.")
-        logger.warning("Continuing deployment without verified Supabase single source of truth connection.")
+        logger.warning("Continuing deployment without verified Supabase connection.")
     else:
         try:
-            # Connect and instantiate the client engine
+            # Initialize Supabase explicitly per the structural constraints
             supabase_client = create_client(supabase_url, supabase_key)
             
-            # Fixed: Using a real table query connection test matching service role requirements
+            # Verify the connection via direct table select check schema pulse
             supabase_client.table("groq_api_keys").select("id").limit(1).execute()
             logger.info("Supabase Connected")
         except Exception as e:
             logger.error(f"Supabase connection validation failed: {str(e)}", exc_info=True)
-            logger.warning("Continuing backend initialization execution with degraded configuration access pools.")
+            logger.warning("Continuing backend initialization execution without crashing.")
 
     # --- STEP 4: EVALUATE KNOWLEDGE BASE STATUS WITHOUT INGESTION BLOCKING ---
     logger.info("Checking Knowledge Base Partition Analytics...")
@@ -149,25 +149,26 @@ def health():
     for monitoring dashboards, verifying connectivity status across database layers.
     """
     redis_healthy = False
-    redis_diagnostics = "disconnected"
+    redis_diagnostics = "unhealthy"
     
     # 1. Safely evaluate Redis connectivity status
     try:
         if hasattr(redis_cache, 'check_connection'):
-            redis_diagnostics = redis_cache.check_connection()
-            if isinstance(redis_diagnostics, dict):
-                redis_healthy = redis_diagnostics.get("status") == "healthy"
+            check_res = redis_cache.check_connection()
+            if isinstance(check_res, dict):
+                redis_healthy = check_res.get("status") == "healthy"
             else:
-                redis_healthy = bool(redis_diagnostics)
+                redis_healthy = bool(check_res)
         elif hasattr(redis_cache, 'redis_client'):
             redis_healthy = bool(redis_cache.redis_client.ping())
-            redis_diagnostics = "connected" if redis_healthy else "disconnected"
-    except Exception as redis_err:
-        redis_diagnostics = {"status": "unhealthy", "error": str(redis_err)}
+        
+        redis_diagnostics = "healthy" if redis_healthy else "unhealthy"
+    except Exception:
+        redis_diagnostics = "unhealthy"
         redis_healthy = False
 
-    # 2. Safely evaluate ChromaDB connectivity and extract nested schema state
-    chroma_status = {"status": "unhealthy", "error": "Unknown status check configuration"}
+    # 2. Safely evaluate ChromaDB connectivity
+    chroma_status = {"status": "unhealthy"}
     chroma_healthy = False
     
     try:
@@ -179,7 +180,7 @@ def health():
             chroma_status = {"status": "healthy" if collection_exists else "unhealthy"}
             chroma_healthy = collection_exists
     except Exception as chroma_err:
-        chroma_status = {"status": "error", "error": str(chroma_err)}
+        chroma_status = {"status": "unhealthy", "error": str(chroma_err)}
         chroma_healthy = False
 
     # 3. Dynamic Supabase connectivity checking using the real data query format
@@ -192,12 +193,12 @@ def health():
         pass
 
     # Compute overall system state based on strict component health criteria
-    system_status = "healthy" if (redis_healthy and chroma_healthy) else "degraded"
+    system_status = "healthy" if (redis_healthy and chroma_healthy and supabase_healthy) else "degraded"
 
     return {
         "status": system_status,
         "redis": redis_diagnostics,
-        "chromadb": chroma_status,
+        "chromadb": chroma_status.get("status", "unhealthy"),
         "supabase": "connected" if supabase_healthy else "disconnected",
         "version": "1.0",
         "timestamp": time.time()
