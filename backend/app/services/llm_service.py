@@ -2,6 +2,7 @@
 import time
 import uuid
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import groq
@@ -80,17 +81,26 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
         knowledge_block = "[NO LOCAL KNOWLEDGE BASE AVAILABLE]"
     else:
         context_instruction = (
-            "Use the provided context block first to construct your answer. "
-            "If the answer cannot be confidently verified using this context, explicitly tell the user "
-            "that reliable local information is not available."
+            "Use the supplied knowledge context as the primary source of truth. "
+            "If the answer cannot be found in the supplied context, politely tell the user that reliable information is unavailable. "
+            "Do not invent facts."
         )
         knowledge_block = clean_context
 
     system_instruction = (
         "You are 'Appna Bank AI', a warm financial companion for farmers, students, and rural communities.\n\n"
+        "STRICT ANSWER OUTPUT CONSTRAINT POLICY:\n"
+        "- Return ONLY the final answer. Never expose your internal reasoning.\n"
+        "- Never output <think> or </think> tags under any circumstances.\n"
+        "- Never output markdown thinking blocks or ```thinking code blocks.\n"
+        "- Never reveal your chain of thought, planning, or internal analysis to the user.\n"
+        "- Never explain how the answer was generated or structured.\n"
+        "- If you generate internal reasoning, discard it completely before sending the response.\n"
+        "- Your final output must contain only the answer that the user should read.\n"
+        "- If internal reasoning exists in your processing space, you must strip it completely before returning your final response.\n\n"
         "RESPONSE RULES:\n"
         f"1. You must reply completely in {detected_language}.\n"
-        "2. Explain everything like a teacher talking to a Class 5 student.\n"
+        "2. Explain everything like a warm teacher talking to a Class 5 student.\n"
         f"3. {context_instruction}\n"
         "4. Strict Hallucination Protection: Do not invent facts.\n\n"
         "FINANCIAL SAFETY MANDATES:\n"
@@ -148,7 +158,22 @@ def ask_the_principal(user_query: str, retrieved_context: Any) -> Dict[str, Any]
                 top_p=TOP_P,
                 stream=STREAM_MODE
             )
-            answer = response.choices[0].message.content
+            
+            raw_content = response.choices[0].message.content or ""
+            
+            # Post-processing sanitization: Clean up XML tags or Markdown blocks detailing reasoning
+            cleaned_content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL | re.IGNORECASE)
+            cleaned_content = re.sub(r'```(?:thinking|think|reasoning)?[\s\S]*?```', '', cleaned_content, flags=re.IGNORECASE)
+            
+            answer = cleaned_content.strip()
+            answer = re.sub(r"\n{3,}", "\n\n", answer)
+            
+            if not answer:
+                answer = (
+                    "Sorry, I couldn't generate a valid response. "
+                    "Please try again."
+                )
+                
             success = True
             
             # Rebalance queue priorities by pushing this successful key back and shifting downstream nodes forward
